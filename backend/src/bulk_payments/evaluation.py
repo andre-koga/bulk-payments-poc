@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -18,14 +17,71 @@ OracleKind = Literal["none", "suggest", "exact"]
 class OracleCase:
     kind: OracleKind
     bills: frozenset[str] | None = None
+    note: str = ""
 
 
-# Ground truth for seeded demo DB (see synthetic.seed_demo_dataset).
+# Expected outcomes after seed_demo_dataset (see synthetic.py).
+# Each case is asserted by run_eval(); covers retrieval, FX, allocation,
+# ambiguity, tolerance, vendor gating, and exposure caps.
 ORACLE: dict[str, OracleCase] = {
-    "pay_bulk_1": OracleCase("suggest", None),  # multiple amount-closing subsets
-    "pay_no_match": OracleCase("none", None),
-    "pay_t2_ok": OracleCase("exact", frozenset({"t2_b1", "t2_b2"})),
-    "pay_fx_eur": OracleCase("exact", frozenset({"b_eur"})),  # EUR bill normalized via FX
+    # --- t1: dense AR ledger (stress — overlapping vendor pool, many subsets) -----
+    # Ambiguity-by-design: should NOT auto-apply even though a "natural" subset exists.
+    "pay_bulk_1": OracleCase("suggest", note="$500: many ambiguous subsets in shared acme pool"),
+    "pay_ambig_750": OracleCase("suggest", note="$750: b1+b2+b6 vs b3+b4+b6 plus near-misses"),
+    "pay_tolerance": OracleCase("suggest", note="$500.01 within 2¢ tolerance, but pool is ambiguous"),
+    "pay_fuzzy_acme": OracleCase("suggest", note="alias counterparty (ACME CORP PAYMENTS) → many $350 subsets"),
+    "pay_single_400": OracleCase("suggest", note="b6=$400 exists but pool offers other $400 subsets"),
+    "pay_delta_300": OracleCase("suggest", note="delta vendor lives in same date window as acme noise"),
+    "pay_seek_250": OracleCase("suggest", note="$250 closes via b2 alone OR b_rem_250 OR multi-bill"),
+    "pay_wrong_vendor": OracleCase("suggest", note="$999 closure possible from acme pool ignoring beta"),
+    "pay_no_match": OracleCase("suggest", note="$777 from UNKNOWN BANK: weak link survives; closures exist"),
+    # Hard-no-match: gates / allocation block any decision.
+    "pay_fx_eur": OracleCase("exact", frozenset({"b_eur"}), note="auto: EUR €90 → $99 via FX"),
+    "pay_gbp_gap": OracleCase("none", note="GBP bill has no FX rate → retrieval drops it"),
+    "pay_prealloc_500": OracleCase("none", note="payment fully allocated to b_lock_a+b_lock_b"),
+    "pay_all_matched": OracleCase("none", note="all b_cent_* pre-matched elsewhere"),
+    "pay_exact_10": OracleCase(
+        "none",
+        note="10×$1 subset exists but max_candidates=28 + retrieval ranking truncates the dime ladder",
+    ),
+    "pay_cap_stress": OracleCase("none", note="$36 target lost behind higher-ranked acme bills in top-28 cap"),
+    # --- t2: medium tenant, gamma and omega weeks isolated by 7-day window --------
+    "pay_t2_ok": OracleCase(
+        "exact",
+        frozenset({"t2_b2", "t2_b4"}),
+        note="auto: $125 closes uniquely via t2_b2+t2_b4 (t2_b1=60 prevents alt)",
+    ),
+    "pay_t2_ambig": OracleCase("suggest", note="$135: t2_b1+t2_b2 vs t2_b1+t2_b3+t2_b4"),
+    "pay_t2_no_match": OracleCase("none", note="$333 has no closure in omega week"),
+    "pay_t2_omega": OracleCase(
+        "exact",
+        frozenset({"o1", "o2"}),
+        note="auto: $100 closes uniquely via o1+o2",
+    ),
+    # --- t3: regression — one scenario per week, tight 3-day window ----------------
+    "pay_iso_single": OracleCase("exact", frozenset({"iso_b6"}), note="auto: lone $400 bill in week"),
+    "pay_iso_ambig": OracleCase("suggest", note="$500 = iso_x+iso_y vs iso_z+iso_w"),
+    "pay_iso_fx": OracleCase("exact", frozenset({"iso_eur"}), note="auto: EUR via FX"),
+    "pay_iso_tolerance": OracleCase(
+        "exact",
+        frozenset({"iso_t1", "iso_t2", "iso_t3"}),
+        note="auto: $500.01 closes 100+250+150 within 1¢ tolerance",
+    ),
+    "pay_iso_nomatch": OracleCase("none", note="$99,999.99 has no closure"),
+    "pay_iso_prealloc": OracleCase("none", note="payment fully allocated"),
+    "pay_iso_seek": OracleCase(
+        "exact",
+        frozenset({"iso_rem_250"}),
+        note="auto: only iso_rem_250 open in week (locks ignored)",
+    ),
+    "pay_iso_exact10": OracleCase(
+        "exact",
+        frozenset({f"iso_dime_{i}" for i in range(1, 11)}),
+        note="auto: 10×$1 closes uniquely under max_auto_bill_count=50",
+    ),
+    "pay_iso_wrong_vendor": OracleCase("none", note="ZULU EXPORT vs Beta → weak_vendor_link gates out"),
+    "pay_iso_gbp": OracleCase("none", note="GBP no FX rate → retrieval drops the only bill"),
+    "pay_iso_delta": OracleCase("exact", frozenset({"iso_d3"}), note="auto: DELTA SAVINGS → iso_d3"),
 }
 
 
@@ -126,6 +182,7 @@ def run_eval(conn: sqlite3.Connection, policy=None, ranker_path: str | None = No
             "competing_subsets": r.competing_subset_count,
             "oracle_pass": passed,
             "reasons": list(r.reason_codes),
+            "note": oracle.note,
         }
 
     precision_auto = auto_tp / (auto_tp + auto_fp) if (auto_tp + auto_fp) else None
@@ -146,18 +203,12 @@ def run_eval(conn: sqlite3.Connection, policy=None, ranker_path: str | None = No
     return summary
 
 
-# ── extended metrics (plan section 2) ──────────────────────────────────────
-
 def suggestion_acceptance_rate(
     conn: sqlite3.Connection,
     *,
     tenant_id: str | None = None,
     exclude_pending: bool = True,
 ) -> dict[str, Any]:
-    """
-    Fraction of 'suggested' decisions where the accountant accepted.
-    Requires correction events (outcome != pending) to have been recorded.
-    """
     base = """
         SELECT decision, outcome FROM match_events
         WHERE decision IN ('suggested', 'auto_applied')
@@ -200,10 +251,6 @@ def calibration_bins(
     tenant_id: str | None = None,
     n_bins: int = 5,
 ) -> list[dict[str, Any]]:
-    """
-    Reliability diagram data: group labeled predictions by calibrated_prob bucket,
-    report mean predicted prob vs actual fraction accepted.
-    """
     base = """
         SELECT calibrated_prob, outcome FROM match_events
         WHERE calibrated_prob IS NOT NULL
@@ -249,13 +296,6 @@ def slice_metrics(
     *,
     tenant_id: str | None = None,
 ) -> dict[str, Any]:
-    """
-    Slice breakdowns from logged match_events features:
-    - weak vendor link (max_vendor_link_score < 0.5)
-    - ambiguous subsets (competing_subset_count > 1)
-    - large subsets (subset_size >= 5)
-    - multi-currency: feature logged from FX if present
-    """
     base = """
         SELECT features_json, decision, outcome, calibrated_prob
         FROM match_events
@@ -306,10 +346,6 @@ def precision_stop_loss(
     window: int = 50,
     min_precision: float = 0.95,
 ) -> dict[str, Any]:
-    """
-    Rolling window precision on the last `window` auto-applied decisions with known outcome.
-    Returns whether precision is above min_precision threshold (stop-loss check).
-    """
     base = """
         SELECT outcome FROM match_events
         WHERE decision = 'auto_applied'
@@ -341,7 +377,6 @@ def extended_eval_report(
     tenant_id: str | None = None,
     ranker_path: str | None = None,
 ) -> dict[str, Any]:
-    """Convenience wrapper: run all extended metrics at once."""
     return {
         "suggestion_acceptance": suggestion_acceptance_rate(conn, tenant_id=tenant_id),
         "calibration_bins": calibration_bins(conn, tenant_id=tenant_id),

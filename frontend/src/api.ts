@@ -62,6 +62,25 @@ export interface Tenant {
   date_window_days: number;
 }
 
+export interface BatchAutoMatchResponse {
+  tenant_id: string;
+  summary: {
+    processed: number;
+    auto_matched: number;
+    needs_review: number;
+    no_match: number;
+    skipped_fully_allocated: number;
+  };
+  auto_matched: Array<{
+    payment_id: string;
+    status: string;
+    decision: string;
+    bill_ids: string[];
+  }>;
+  needs_review: MatchResult[];
+  no_match: Array<{ payment_id: string; status: string; decision: string }>;
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -92,15 +111,21 @@ export const api = {
     eventId: string,
     outcome: string,
     correctedBillIds?: string[],
-    userId?: string
+    options?: { userId?: string; accountantReasoning?: string }
   ) =>
     apiFetch<{ event_id: string; outcome: string }>(`/match-events/${eventId}/outcome`, {
       method: "POST",
       body: JSON.stringify({
         outcome,
         corrected_bill_ids: correctedBillIds ?? null,
-        user_id: userId ?? null,
+        user_id: options?.userId ?? null,
+        accountant_reasoning: options?.accountantReasoning?.trim() || null,
       }),
+    }),
+
+  autoMatchAll: (tenantId: string) =>
+    apiFetch<BatchAutoMatchResponse>(`/tenants/${tenantId}/auto-match`, {
+      method: "POST",
     }),
 
   unmatchPayment: (tenantId: string, paymentId: string) =>

@@ -1,5 +1,11 @@
-import { useEffect, useReducer, useState } from "react";
-import { api, type MatchResult, type Payment, type Tenant } from "./api";
+import { useEffect, useMemo, useReducer, useState } from "react";
+import {
+  api,
+  type BatchAutoMatchResponse,
+  type MatchResult,
+  type Payment,
+  type Tenant,
+} from "./api";
 import "./App.css";
 
 type MatchState =
@@ -39,7 +45,13 @@ function reducer(state: State, action: Action): State {
     case "SET_TENANTS":
       return { ...state, tenants: action.tenants };
     case "SELECT_TENANT":
-      return { ...state, selectedTenant: action.id, payments: [], match: {}, feedback: {} };
+      return {
+        ...state,
+        selectedTenant: action.id,
+        payments: [],
+        match: {},
+        feedback: {},
+      };
     case "SET_PAYMENTS":
       return { ...state, payments: action.payments };
     case "MATCH_LOADING":
@@ -120,10 +132,64 @@ function billIdsKey(ids: string[]) {
   return [...ids].sort().join(",");
 }
 
+type PendingReviewAction =
+  | { kind: "accept_top"; eventId: string; billIds: string[] }
+  | { kind: "accept_alt"; eventId: string; subsetIndex: number; billIds: string[] }
+  | { kind: "reject_top"; eventId: string };
+
+function needsExpertReasoning(data: MatchResult) {
+  return data.decision === "suggested" || data.competing_subset_count > 1;
+}
+
+function AutoMatchBar({
+  loading,
+  summary,
+  openCount,
+  onRun,
+}: {
+  loading: boolean;
+  summary: BatchAutoMatchResponse["summary"] | null;
+  openCount: number;
+  onRun: () => void;
+}) {
+  return (
+    <section className="auto-match-bar">
+      <div className="auto-match-copy">
+        <h2>Autonomous matching</h2>
+        <p>
+          Run the matcher across all open payments. Confident unique matches are applied
+          automatically; ambiguous cases are queued below for expert review.
+        </p>
+      </div>
+      <button
+        type="button"
+        className="btn-auto-match"
+        onClick={onRun}
+        disabled={loading || openCount === 0}
+      >
+        {loading ? "Running auto-match…" : `Auto-match all (${openCount} open)`}
+      </button>
+      {summary && (
+        <div className="auto-match-stats">
+          <span className="stat stat-auto">{summary.auto_matched} auto-matched</span>
+          <span className="stat stat-review">{summary.needs_review} expert review</span>
+          <span className="stat stat-none">{summary.no_match} no match</span>
+          {summary.skipped_fully_allocated > 0 && (
+            <span className="stat stat-skip">
+              {summary.skipped_fully_allocated} already complete
+            </span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function MatchPanel({
   payment,
   matchState,
   paymentFeedback,
+  expertReview,
   onRunMatch,
   onAcceptTop,
   onRejectTop,
@@ -134,13 +200,22 @@ function MatchPanel({
   payment: Payment;
   matchState: MatchState;
   paymentFeedback: PaymentFeedback | undefined;
+  expertReview: boolean;
   onRunMatch: () => void;
-  onAcceptTop: (eventId: string, billIds: string[]) => void;
-  onRejectTop: (eventId: string) => void;
-  onAcceptAlternate: (eventId: string, subsetIndex: number, billIds: string[]) => void;
+  onAcceptTop: (eventId: string, billIds: string[], reasoning?: string) => void;
+  onRejectTop: (eventId: string, reasoning?: string) => void;
+  onAcceptAlternate: (
+    eventId: string,
+    subsetIndex: number,
+    billIds: string[],
+    reasoning?: string
+  ) => void;
   onUnmatch: () => void;
   unmatchLoading: boolean;
 }) {
+  const [pendingAction, setPendingAction] = useState<PendingReviewAction | null>(null);
+  const [reasoning, setReasoning] = useState("");
+  const [reasoningError, setReasoningError] = useState<string | null>(null);
   const matchedBillIds =
     paymentFeedback?.status === "accepted"
       ? paymentFeedback.billIds
@@ -166,8 +241,71 @@ function MatchPanel({
     matchState.data.subsets.length > 0 &&
     !matchState.data.reason_codes.includes("payment_fully_allocated");
 
+  const matchData = matchState.kind === "result" ? matchState.data : null;
+  const expertReasoningRequired = matchData ? needsExpertReasoning(matchData) : false;
+
+  const submitPendingAction = () => {
+    if (!pendingAction) return;
+    if (expertReasoningRequired && !reasoning.trim()) {
+      setReasoningError("Please explain your choice — used to train the ranker.");
+      return;
+    }
+    const text = reasoning.trim() || undefined;
+    if (pendingAction.kind === "accept_top") {
+      onAcceptTop(pendingAction.eventId, pendingAction.billIds, text);
+    } else if (pendingAction.kind === "accept_alt") {
+      onAcceptAlternate(
+        pendingAction.eventId,
+        pendingAction.subsetIndex,
+        pendingAction.billIds,
+        text
+      );
+    } else {
+      onRejectTop(pendingAction.eventId, text);
+    }
+    setPendingAction(null);
+    setReasoning("");
+    setReasoningError(null);
+  };
+
+  const requestAcceptTop = (eid: string, billIds: string[]) => {
+    if (expertReasoningRequired) {
+      setPendingAction({ kind: "accept_top", eventId: eid, billIds });
+      setReasoning("");
+      setReasoningError(null);
+      return;
+    }
+    onAcceptTop(eid, billIds);
+  };
+
+  const requestAcceptAlt = (eid: string, subsetIndex: number, billIds: string[]) => {
+    if (expertReasoningRequired) {
+      setPendingAction({ kind: "accept_alt", eventId: eid, subsetIndex, billIds });
+      setReasoning("");
+      setReasoningError(null);
+      return;
+    }
+    onAcceptAlternate(eid, subsetIndex, billIds);
+  };
+
+  const requestRejectTop = (eid: string) => {
+    if (expertReasoningRequired) {
+      setPendingAction({ kind: "reject_top", eventId: eid });
+      setReasoning("");
+      setReasoningError(null);
+      return;
+    }
+    onRejectTop(eid);
+  };
+
   return (
-    <div className="match-panel">
+    <div className={`match-panel ${expertReview ? "match-panel-expert" : ""}`}>
+      {expertReview && (
+        <div className="expert-review-banner">
+          <span className="badge badge-suggest">Expert review</span>
+          Ambiguous match — choose a subset and document why.
+        </div>
+      )}
       <div className="payment-row">
         <div className="payment-meta">
           <span className="payment-amount">{payment.amount_display}</span>
@@ -243,6 +381,50 @@ function MatchPanel({
             )}
           </div>
 
+          {expertReasoningRequired && canReviewMatch && (
+            <p className="alt-hint">
+              Multiple valid subsets — your reasoning is saved for model fine-tuning.
+            </p>
+          )}
+
+          {pendingAction && (
+            <div className="reasoning-panel">
+              <label className="reasoning-label" htmlFor={`reasoning-${payment.payment_id}`}>
+                {pendingAction.kind === "reject_top"
+                  ? "Why reject the top suggestion?"
+                  : "Why did you choose this subset?"}
+              </label>
+              <textarea
+                id={`reasoning-${payment.payment_id}`}
+                className="reasoning-input"
+                rows={3}
+                placeholder="e.g. Vendor alias matches bank statement; PO #12345 on remittance…"
+                value={reasoning}
+                onChange={(e) => {
+                  setReasoning(e.target.value);
+                  setReasoningError(null);
+                }}
+              />
+              {reasoningError && <p className="reasoning-error">{reasoningError}</p>}
+              <div className="feedback-row">
+                <button type="button" className="btn-accept" onClick={submitPendingAction}>
+                  Confirm
+                </button>
+                <button
+                  type="button"
+                  className="btn-reject"
+                  onClick={() => {
+                    setPendingAction(null);
+                    setReasoning("");
+                    setReasoningError(null);
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
           {topRejected && canReviewMatch && (
             <p className="alt-hint">
               Top suggestion rejected — choose another subset below.
@@ -278,8 +460,25 @@ function MatchPanel({
             </p>
           )}
 
-          {canReviewMatch &&
-            matchState.data.subsets.map((subset, i) => {
+          {canReviewMatch && matchState.data.subsets.length > 1 && (
+            <p className="subsets-scroll-hint">
+              {matchState.data.subsets.length} suggestions shown
+              {matchState.data.competing_subset_count > matchState.data.subsets.length
+                ? ` (${matchState.data.competing_subset_count} total)`
+                : ""}
+              — scroll inside the panel
+            </p>
+          )}
+
+          {canReviewMatch && (
+            <div
+              className={
+                matchState.data.subsets.length > 1 ? "subsets-scroll" : "subsets-list"
+              }
+              role="region"
+              aria-label="Match suggestions"
+            >
+            {matchState.data.subsets.map((subset, i) => {
             const isTop = i === 0;
             const isAcceptedChoice =
               hasAllocation &&
@@ -308,17 +507,17 @@ function MatchPanel({
                   ))}
                 </ul>
 
-                {showTopActions && (
+                {showTopActions && !pendingAction && (
                   <div className="feedback-row">
                     <button
                       className="btn-accept"
-                      onClick={() => onAcceptTop(eventId!, subset.bill_ids)}
+                      onClick={() => requestAcceptTop(eventId!, subset.bill_ids)}
                     >
                       ✓ Accept
                     </button>
                     <button
                       className="btn-reject"
-                      onClick={() => onRejectTop(eventId!)}
+                      onClick={() => requestRejectTop(eventId!)}
                     >
                       ✗ Reject
                     </button>
@@ -329,11 +528,11 @@ function MatchPanel({
                   <div className="feedback-done feedback-rejected">Top suggestion rejected ✗</div>
                 )}
 
-                {showAltAccept && (
+                {showAltAccept && !pendingAction && (
                   <div className="feedback-row">
                     <button
                       className="btn-accept"
-                      onClick={() => onAcceptAlternate(eventId!, i, subset.bill_ids)}
+                      onClick={() => requestAcceptAlt(eventId!, i, subset.bill_ids)}
                     >
                       ✓ Accept this subset
                     </button>
@@ -346,6 +545,8 @@ function MatchPanel({
               </div>
             );
           })}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -356,6 +557,11 @@ export default function App() {
   const [state, dispatch] = useReducer(reducer, initialState);
   const [apiError, setApiError] = useState<string | null>(null);
   const [unmatchLoadingId, setUnmatchLoadingId] = useState<string | null>(null);
+  const [batchLoading, setBatchLoading] = useState(false);
+  const [batchSummary, setBatchSummary] = useState<BatchAutoMatchResponse["summary"] | null>(
+    null
+  );
+  const [expertReviewIds, setExpertReviewIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     api
@@ -369,11 +575,27 @@ export default function App() {
 
   useEffect(() => {
     if (!state.selectedTenant) return;
+    setBatchSummary(null);
+    setExpertReviewIds(new Set());
     api
       .listPayments(state.selectedTenant)
       .then((ps) => dispatch({ type: "SET_PAYMENTS", payments: ps }))
       .catch((e) => setApiError(String(e)));
   }, [state.selectedTenant]);
+
+  const openPaymentCount = useMemo(
+    () => state.payments.filter((p) => !p.settlement?.is_fully_allocated).length,
+    [state.payments]
+  );
+
+  const sortedPayments = useMemo(() => {
+    return [...state.payments].sort((a, b) => {
+      const aExpert = expertReviewIds.has(a.payment_id) ? 0 : 1;
+      const bExpert = expertReviewIds.has(b.payment_id) ? 0 : 1;
+      if (aExpert !== bExpert) return aExpert - bExpert;
+      return a.payment_date.localeCompare(b.payment_date);
+    });
+  }, [state.payments, expertReviewIds]);
 
   const isFullyAllocated = (payment: Payment) =>
     payment.settlement?.is_fully_allocated === true;
@@ -408,19 +630,29 @@ export default function App() {
       );
   };
 
-  const handleAcceptTop = (paymentId: string, eventId: string, billIds: string[]) => {
+  const handleAcceptTop = (
+    paymentId: string,
+    eventId: string,
+    billIds: string[],
+    reasoning?: string
+  ) => {
     api
-      .recordOutcome(eventId, "accepted_as_is", billIds)
+      .recordOutcome(eventId, "accepted_as_is", billIds, { accountantReasoning: reasoning })
       .then(() => {
         dispatch({ type: "ACCEPTED", paymentId, eventId, subsetIndex: 0, billIds });
+        setExpertReviewIds((prev) => {
+          const next = new Set(prev);
+          next.delete(paymentId);
+          return next;
+        });
         return refreshPayments();
       })
       .catch((e) => setApiError(String(e)));
   };
 
-  const handleRejectTop = (paymentId: string, eventId: string) => {
+  const handleRejectTop = (paymentId: string, eventId: string, reasoning?: string) => {
     api
-      .recordOutcome(eventId, "rejected")
+      .recordOutcome(eventId, "rejected", undefined, { accountantReasoning: reasoning })
       .then(() => dispatch({ type: "TOP_REJECTED", paymentId, eventId }))
       .catch((e) => setApiError(String(e)));
   };
@@ -429,15 +661,40 @@ export default function App() {
     paymentId: string,
     eventId: string,
     subsetIndex: number,
-    billIds: string[]
+    billIds: string[],
+    reasoning?: string
   ) => {
     api
-      .recordOutcome(eventId, "edited_subset", billIds)
+      .recordOutcome(eventId, "edited_subset", billIds, { accountantReasoning: reasoning })
       .then(() => {
         dispatch({ type: "ACCEPTED", paymentId, eventId, subsetIndex, billIds });
+        setExpertReviewIds((prev) => {
+          const next = new Set(prev);
+          next.delete(paymentId);
+          return next;
+        });
         return refreshPayments();
       })
       .catch((e) => setApiError(String(e)));
+  };
+
+  const handleAutoMatchAll = () => {
+    if (!state.selectedTenant) return;
+    setBatchLoading(true);
+    setApiError(null);
+    api
+      .autoMatchAll(state.selectedTenant)
+      .then((res) => {
+        setBatchSummary(res.summary);
+        const reviewIds = new Set(res.needs_review.map((m) => m.payment_id));
+        setExpertReviewIds(reviewIds);
+        res.needs_review.forEach((m) => {
+          dispatch({ type: "MATCH_RESULT", paymentId: m.payment_id, data: m });
+        });
+        return refreshPayments();
+      })
+      .catch((e) => setApiError(String(e)))
+      .finally(() => setBatchLoading(false));
   };
 
   const handleUnmatch = (payment: Payment) => {
@@ -489,23 +746,37 @@ export default function App() {
         </div>
       )}
 
+      {state.selectedTenant && state.payments.length > 0 && (
+        <AutoMatchBar
+          loading={batchLoading}
+          summary={batchSummary}
+          openCount={openPaymentCount}
+          onRun={handleAutoMatchAll}
+        />
+      )}
+
       <main className="payment-list">
         {state.payments.length === 0 && !apiError && (
           <p className="empty-state">
             No payments found. Run <code>bulk-match seed</code> to load demo data.
           </p>
         )}
-        {state.payments.map((payment) => (
+        {sortedPayments.map((payment) => (
           <MatchPanel
             key={payment.payment_id}
             payment={payment}
             matchState={state.match[payment.payment_id] ?? { kind: "idle" }}
             paymentFeedback={state.feedback[payment.payment_id]}
+            expertReview={expertReviewIds.has(payment.payment_id)}
             onRunMatch={() => handleRunMatch(payment)}
-            onAcceptTop={(eid, bills) => handleAcceptTop(payment.payment_id, eid, bills)}
-            onRejectTop={(eid) => handleRejectTop(payment.payment_id, eid)}
-            onAcceptAlternate={(eid, idx, bills) =>
-              handleAcceptAlternate(payment.payment_id, eid, idx, bills)
+            onAcceptTop={(eid, bills, reasoning) =>
+              handleAcceptTop(payment.payment_id, eid, bills, reasoning)
+            }
+            onRejectTop={(eid, reasoning) =>
+              handleRejectTop(payment.payment_id, eid, reasoning)
+            }
+            onAcceptAlternate={(eid, idx, bills, reasoning) =>
+              handleAcceptAlternate(payment.payment_id, eid, idx, bills, reasoning)
             }
             onUnmatch={() => handleUnmatch(payment)}
             unmatchLoading={unmatchLoadingId === payment.payment_id}

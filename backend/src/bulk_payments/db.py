@@ -109,11 +109,20 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+    _migrate(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
     )
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_events)").fetchall()}
+    if "accountant_reasoning" not in cols:
+        conn.execute(
+            "ALTER TABLE match_events ADD COLUMN accountant_reasoning TEXT"
+        )
 
 
 def insert_match_event(
@@ -130,6 +139,7 @@ def insert_match_event(
     calibrated_prob: float | None = None,
     reason_codes: list[str] | None = None,
     user_id: str | None = None,
+    accountant_reasoning: str | None = None,
 ) -> str:
     event_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -138,8 +148,8 @@ def insert_match_event(
         INSERT INTO match_events(
           event_id, tenant_id, payment_id, bill_ids_json, rules_version,
           features_json, decision, outcome, ranker_score, calibrated_prob,
-          reason_codes_json, user_id, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          reason_codes_json, user_id, accountant_reasoning, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             event_id,
@@ -154,6 +164,7 @@ def insert_match_event(
             calibrated_prob,
             json.dumps(reason_codes or []),
             user_id,
+            accountant_reasoning,
             now,
         ),
     )

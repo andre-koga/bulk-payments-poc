@@ -11,7 +11,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from bulk_payments.allocation import get_payment_allocation, unmatch_payment
+from bulk_payments.allocation import apply_accepted_bills, get_payment_allocation, unmatch_payment
+from bulk_payments.batch import run_batch_auto_match
 from bulk_payments.db import connect, insert_match_event, init_db
 from bulk_payments.evaluation import extended_eval_report
 from bulk_payments.matcher import match_payment
@@ -102,6 +103,7 @@ class OutcomeIn(BaseModel):
     outcome: str  # accepted_as_is | rejected | edited_subset | manual_alternative
     corrected_bill_ids: list[str] | None = None
     user_id: str | None = None
+    accountant_reasoning: str | None = None
 
 
 class OutcomeOut(BaseModel):
@@ -113,6 +115,14 @@ class UnmatchOut(BaseModel):
     payment_id: str
     freed_bill_ids: list[str]
     event_id: str | None = None
+
+
+class BatchAutoMatchOut(BaseModel):
+    tenant_id: str
+    summary: dict[str, int]
+    auto_matched: list[dict[str, Any]]
+    needs_review: list[MatchResultOut]
+    no_match: list[dict[str, Any]]
 
 
 # ---------- helpers ----------
@@ -133,6 +143,38 @@ def _payment_settlement(
         allocated_sum_minor=alloc.allocated_sum_minor,
         remaining_minor=alloc.remaining_minor,
         is_fully_allocated=alloc.is_fully_allocated,
+    )
+
+
+def _match_result_out(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    r,
+    event_id: str | None,
+) -> MatchResultOut:
+    cfg = load_tenant_config(conn, tenant_id)
+    return MatchResultOut(
+        payment_id=r.payment_id,
+        tenant_id=r.tenant_id,
+        decision=r.decision.value,
+        unique_best=r.unique_best,
+        competing_subset_count=r.competing_subset_count,
+        reason_codes=list(r.reason_codes),
+        subsets=[
+            SubsetOut(
+                bill_ids=list(s.bill_ids),
+                sum_minor=s.sum_minor,
+                abs_residual_minor=s.abs_residual_minor,
+                sum_display=_fmt_minor(s.sum_minor, cfg.ledger_currency),
+            )
+            for s in r.subsets
+        ],
+        ranker_score=r.ranker_score,
+        calibrated_accept_prob=r.calibrated_accept_prob,
+        event_id=event_id,
+        allocated_sum_minor=r.allocated_sum_minor,
+        remaining_minor=r.remaining_minor,
+        is_fully_allocated=r.is_fully_allocated,
     )
 
 
@@ -227,35 +269,9 @@ def run_match(tenant_id: str, payment_id: str) -> MatchResultOut:
         raise HTTPException(status_code=400, detail=str(e))
 
     event_id = _latest_event_for_payment(conn, payment_id)
+    out = _match_result_out(conn, tenant_id, r, event_id)
     conn.close()
-
-    cfg_conn = connect(DB_PATH)
-    cfg = load_tenant_config(cfg_conn, tenant_id)
-    cfg_conn.close()
-
-    return MatchResultOut(
-        payment_id=r.payment_id,
-        tenant_id=r.tenant_id,
-        decision=r.decision.value,
-        unique_best=r.unique_best,
-        competing_subset_count=r.competing_subset_count,
-        reason_codes=list(r.reason_codes),
-        subsets=[
-            SubsetOut(
-                bill_ids=list(s.bill_ids),
-                sum_minor=s.sum_minor,
-                abs_residual_minor=s.abs_residual_minor,
-                sum_display=_fmt_minor(s.sum_minor, cfg.ledger_currency),
-            )
-            for s in r.subsets
-        ],
-        ranker_score=r.ranker_score,
-        calibrated_accept_prob=r.calibrated_accept_prob,
-        event_id=event_id,
-        allocated_sum_minor=r.allocated_sum_minor,
-        remaining_minor=r.remaining_minor,
-        is_fully_allocated=r.is_fully_allocated,
-    )
+    return out
 
 
 @app.post("/tenants/{tenant_id}/payments/{payment_id}/unmatch", response_model=UnmatchOut)
@@ -313,9 +329,23 @@ def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
         conn.close()
         raise HTTPException(status_code=404, detail="event_id not found")
 
-    # Append-only: insert a new correction row linked to the original
     corrected_bills = body.corrected_bill_ids or json.loads(orig["bill_ids_json"])
     features = json.loads(orig["features_json"])
+    if body.accountant_reasoning:
+        features["accountant_reasoning"] = body.accountant_reasoning
+
+    if body.outcome in ("accepted_as_is", "edited_subset"):
+        try:
+            apply_accepted_bills(
+                conn,
+                tenant_id=orig["tenant_id"],
+                payment_id=orig["payment_id"],
+                bill_ids=corrected_bills,
+            )
+        except ValueError as e:
+            conn.close()
+            raise HTTPException(status_code=422, detail=str(e))
+
     new_event_id = insert_match_event(
         conn,
         tenant_id=orig["tenant_id"],
@@ -329,61 +359,39 @@ def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
         calibrated_prob=orig["calibrated_prob"],
         reason_codes=json.loads(orig["reason_codes_json"]),
         user_id=body.user_id,
+        accountant_reasoning=body.accountant_reasoning,
     )
-
-    # When accepted, mark matched_payment_id on bills so they are excluded from future retrieval
-    if body.outcome in ("accepted_as_is", "edited_subset"):
-        payment_row = conn.execute(
-            "SELECT payment_id, tenant_id FROM match_events WHERE event_id = ?", (event_id,)
-        ).fetchone()
-        pid = payment_row["payment_id"] if payment_row else None
-        tid = payment_row["tenant_id"] if payment_row else None
-        if pid and tid:
-            cfg = load_tenant_config(conn, tid)
-            alloc = get_payment_allocation(conn, tid, pid)
-            # Sum ledger amounts for bills being added (must not exceed payment total)
-            new_bills = [b for b in corrected_bills if b not in alloc.matched_bill_ids]
-            add_sum = 0
-            for bid in new_bills:
-                brow = conn.execute(
-                    "SELECT open_amount_minor, currency, open_date FROM bills WHERE bill_id = ?",
-                    (bid,),
-                ).fetchone()
-                if brow is None:
-                    continue
-                if brow["currency"] == cfg.ledger_currency:
-                    add_sum += int(brow["open_amount_minor"])
-                else:
-                    from bulk_payments.fx import convert_to_ledger
-
-                    pay = load_payment(conn, pid)
-                    add_sum += convert_to_ledger(
-                        conn,
-                        tenant_id=tid,
-                        amount_minor=int(brow["open_amount_minor"]),
-                        from_currency=brow["currency"],
-                        to_currency=cfg.ledger_currency,
-                        as_of=pay.payment_date,
-                    )[0]
-            total_after = alloc.allocated_sum_minor + add_sum
-            if total_after > alloc.payment_amount_minor + cfg.amount_tolerance_minor:
-                conn.close()
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"Cannot allocate ${total_after/100:.2f} to a ${alloc.payment_amount_minor/100:.2f} "
-                        "payment; unmatch existing bills first to change allocation."
-                    ),
-                )
-            for bid in corrected_bills:
-                conn.execute(
-                    "UPDATE bills SET matched_payment_id = ? WHERE bill_id = ? AND matched_payment_id IS NULL",
-                    (pid, bid),
-                )
-            conn.commit()
 
     conn.close()
     return OutcomeOut(event_id=new_event_id, outcome=body.outcome)
+
+
+@app.post("/tenants/{tenant_id}/auto-match", response_model=BatchAutoMatchOut)
+def batch_auto_match(tenant_id: str) -> BatchAutoMatchOut:
+    """
+    Run matcher on all open payments: auto-apply confident matches,
+    queue ambiguous suggestions for expert review.
+    """
+    conn = _get_conn()
+    row = conn.execute("SELECT tenant_id FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="tenant not found")
+
+    raw = run_batch_auto_match(conn, tenant_id=tenant_id, ranker_path=RANKER_PATH)
+
+    needs_review_out: list[MatchResultOut] = []
+    for r, event_id in raw.get("needs_review_results", []):
+        needs_review_out.append(_match_result_out(conn, tenant_id, r, event_id))
+
+    conn.close()
+    return BatchAutoMatchOut(
+        tenant_id=tenant_id,
+        summary=raw["summary"],
+        auto_matched=raw["auto_matched"],
+        needs_review=needs_review_out,
+        no_match=raw["no_match"],
+    )
 
 
 @app.post("/tenants/{tenant_id}/ranker-gate")
