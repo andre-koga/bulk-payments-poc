@@ -5,6 +5,7 @@ from typing import Any
 
 import sqlite3
 
+from bulk_payments.allocation import get_payment_allocation
 from bulk_payments.db import insert_match_event
 from bulk_payments.models import Bill, DecisionKind, MatchResult, Payment, SubsetCandidate, TenantConfig, Vendor
 from bulk_payments.policy import PolicyConfig, choose_decision
@@ -101,6 +102,42 @@ def match_payment(
     payment = load_payment(conn, payment_id)
     if payment.tenant_id != tenant_id:
         raise ValueError("payment tenant mismatch")
+
+    alloc = get_payment_allocation(conn, tenant_id, payment_id)
+    if alloc.is_fully_allocated:
+        res = MatchResult(
+            payment_id=payment_id,
+            tenant_id=tenant_id,
+            decision=DecisionKind.NO_CANDIDATES,
+            subsets=(),
+            unique_best=False,
+            competing_subset_count=0,
+            reason_codes=("payment_fully_allocated",),
+            features={
+                "allocated_sum_minor": alloc.allocated_sum_minor,
+                "remaining_minor": alloc.remaining_minor,
+            },
+            allocated_sum_minor=alloc.allocated_sum_minor,
+            remaining_minor=alloc.remaining_minor,
+            is_fully_allocated=True,
+        )
+        if log_event:
+            insert_match_event(
+                conn,
+                tenant_id=tenant_id,
+                payment_id=payment_id,
+                bill_ids=list(alloc.matched_bill_ids),
+                rules_version=cfg.rules_version,
+                features=res.features,
+                decision=res.decision.value,
+                reason_codes=list(res.reason_codes),
+            )
+        return res
+
+    target_minor = (
+        alloc.remaining_minor if alloc.matched_bill_ids else payment.amount_minor
+    )
+
     bills = load_bills(conn, tenant_id)
     vendors = _vendors_as_objects(load_vendors(conn, tenant_id))
 
@@ -117,7 +154,13 @@ def match_payment(
             unique_best=False,
             competing_subset_count=0,
             reason_codes=tuple(reason_codes) or ("retrieval_or_gates_failed",),
-            features={},
+            features={
+                "allocated_sum_minor": alloc.allocated_sum_minor,
+                "remaining_minor": target_minor,
+            },
+            allocated_sum_minor=alloc.allocated_sum_minor,
+            remaining_minor=target_minor,
+            is_fully_allocated=False,
         )
         if log_event:
             insert_match_event(
@@ -134,7 +177,7 @@ def match_payment(
 
     feasible = find_feasible_subsets(
         gates.bills,
-        payment.amount_minor,
+        target_minor,
         cfg.amount_tolerance_minor,
         max_solutions=50,
     )
@@ -182,6 +225,14 @@ def match_payment(
     )
     reason_codes.extend(dreasons)
 
+    if alloc.matched_bill_ids:
+        feats = {
+            **feats,
+            "allocated_sum_minor": alloc.allocated_sum_minor,
+            "remaining_minor": target_minor,
+            "matching_remaining_only": True,
+        }
+
     res = MatchResult(
         payment_id=payment_id,
         tenant_id=tenant_id,
@@ -193,6 +244,9 @@ def match_payment(
         features=feats,
         ranker_score=raw_score,
         calibrated_accept_prob=cal_prob,
+        allocated_sum_minor=alloc.allocated_sum_minor,
+        remaining_minor=target_minor,
+        is_fully_allocated=False,
     )
 
     if log_event:

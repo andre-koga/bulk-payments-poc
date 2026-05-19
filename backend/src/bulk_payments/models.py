@@ -88,6 +88,9 @@ class MatchResult:
     features: dict[str, Any] = field(default_factory=dict)
     ranker_score: float | None = None
     calibrated_accept_prob: float | None = None
+    allocated_sum_minor: int = 0
+    remaining_minor: int | None = None
+    is_fully_allocated: bool = False
 
 
 @dataclass(frozen=True)

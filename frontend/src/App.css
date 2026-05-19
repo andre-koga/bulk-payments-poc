@@ -140,6 +140,26 @@ body {
 }
 .btn-reject:hover { background: #b52828; }
 
+.btn-unmatch {
+  margin-top: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid #c9a227;
+  border-radius: 6px;
+  background: #fff;
+  color: #856404;
+  cursor: pointer;
+  width: 100%;
+}
+.btn-unmatch:hover:not(:disabled) {
+  background: #fff8e6;
+}
+.btn-unmatch:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
 /* ── badges ── */
 .badge {
   display: inline-block;
@@ -237,3 +257,39 @@ body {
 }
 .feedback-accepted { color: #14a651; }
 .feedback-rejected { color: #e53e3e; }
+
+.settled-banner {
+  background: #e8f5e9;
+  border: 1px solid #a5d6a7;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.settled-label {
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.settled-hint {
+  display: block;
+  margin-top: 6px;
+  color: #555;
+  font-size: 12px;
+}
+
+.alt-hint {
+  font-size: 13px;
+  color: #856404;
+  margin: 0 0 10px;
+}
+
+.subset-chosen {
+  border-color: #14a651;
+  background: #f1faf4;
+}

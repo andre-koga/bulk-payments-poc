@@ -1,5 +1,12 @@
 const BASE = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000";
 
+export interface PaymentSettlement {
+  bill_ids: string[];
+  allocated_sum_minor: number;
+  remaining_minor: number;
+  is_fully_allocated: boolean;
+}
+
 export interface Payment {
   payment_id: string;
   tenant_id: string;
@@ -9,6 +16,8 @@ export interface Payment {
   counterparty_bank_name: string;
   description: string;
   source_currency: string | null;
+  /** Present when bills are already allocated to this payment (persists across reload). */
+  settlement: PaymentSettlement | null;
 }
 
 export interface Bill {
@@ -41,6 +50,9 @@ export interface MatchResult {
   ranker_score: number | null;
   calibrated_accept_prob: number | null;
   event_id: string | null;
+  allocated_sum_minor: number;
+  remaining_minor: number | null;
+  is_fully_allocated: boolean;
 }
 
 export interface Tenant {
@@ -90,4 +102,10 @@ export const api = {
         user_id: userId ?? null,
       }),
     }),
+
+  unmatchPayment: (tenantId: string, paymentId: string) =>
+    apiFetch<{ payment_id: string; freed_bill_ids: string[]; event_id: string | null }>(
+      `/tenants/${tenantId}/payments/${paymentId}/unmatch`,
+      { method: "POST" }
+    ),
 };

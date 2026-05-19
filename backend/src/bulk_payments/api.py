@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from bulk_payments.allocation import get_payment_allocation, unmatch_payment
 from bulk_payments.db import connect, insert_match_event, init_db
 from bulk_payments.evaluation import extended_eval_report
 from bulk_payments.matcher import match_payment
@@ -61,6 +62,16 @@ class MatchResultOut(BaseModel):
     ranker_score: float | None
     calibrated_accept_prob: float | None
     event_id: str | None
+    allocated_sum_minor: int = 0
+    remaining_minor: int | None = None
+    is_fully_allocated: bool = False
+
+
+class PaymentSettlementOut(BaseModel):
+    bill_ids: list[str]
+    allocated_sum_minor: int
+    remaining_minor: int
+    is_fully_allocated: bool
 
 
 class PaymentOut(BaseModel):
@@ -72,6 +83,7 @@ class PaymentOut(BaseModel):
     counterparty_bank_name: str
     description: str
     source_currency: str | None
+    settlement: PaymentSettlementOut | None = None
 
 
 class BillOut(BaseModel):
@@ -97,10 +109,31 @@ class OutcomeOut(BaseModel):
     outcome: str
 
 
+class UnmatchOut(BaseModel):
+    payment_id: str
+    freed_bill_ids: list[str]
+    event_id: str | None = None
+
+
 # ---------- helpers ----------
 
 def _fmt_minor(minor: int, currency: str = "USD") -> str:
     return f"{currency} {minor / 100:.2f}"
+
+
+def _payment_settlement(
+    conn: sqlite3.Connection, tenant_id: str, payment_id: str
+) -> PaymentSettlementOut | None:
+    """Bills already allocated to this payment (survives page reload)."""
+    alloc = get_payment_allocation(conn, tenant_id, payment_id)
+    if not alloc.matched_bill_ids:
+        return None
+    return PaymentSettlementOut(
+        bill_ids=list(alloc.matched_bill_ids),
+        allocated_sum_minor=alloc.allocated_sum_minor,
+        remaining_minor=alloc.remaining_minor,
+        is_fully_allocated=alloc.is_fully_allocated,
+    )
 
 
 def _latest_event_for_payment(conn: sqlite3.Connection, payment_id: str) -> str | None:
@@ -128,20 +161,24 @@ def list_payments(tenant_id: str) -> list[PaymentOut]:
         "SELECT * FROM payments WHERE tenant_id = ? ORDER BY payment_date DESC",
         (tenant_id,),
     ).fetchall()
-    conn.close()
-    return [
-        PaymentOut(
-            payment_id=r["payment_id"],
-            tenant_id=r["tenant_id"],
-            amount_minor=r["amount_minor"],
-            amount_display=_fmt_minor(r["amount_minor"], r["source_currency"] or "USD"),
-            payment_date=r["payment_date"],
-            counterparty_bank_name=r["counterparty_bank_name"],
-            description=r["description"] or "",
-            source_currency=r["source_currency"],
+    out: list[PaymentOut] = []
+    for r in rows:
+        pid = r["payment_id"]
+        out.append(
+            PaymentOut(
+                payment_id=pid,
+                tenant_id=r["tenant_id"],
+                amount_minor=r["amount_minor"],
+                amount_display=_fmt_minor(r["amount_minor"], r["source_currency"] or "USD"),
+                payment_date=r["payment_date"],
+                counterparty_bank_name=r["counterparty_bank_name"],
+                description=r["description"] or "",
+                source_currency=r["source_currency"],
+                settlement=_payment_settlement(conn, tenant_id, pid),
+            )
         )
-        for r in rows
-    ]
+    conn.close()
+    return out
 
 
 @app.get("/tenants/{tenant_id}/bills", response_model=list[BillOut])
@@ -215,6 +252,47 @@ def run_match(tenant_id: str, payment_id: str) -> MatchResultOut:
         ranker_score=r.ranker_score,
         calibrated_accept_prob=r.calibrated_accept_prob,
         event_id=event_id,
+        allocated_sum_minor=r.allocated_sum_minor,
+        remaining_minor=r.remaining_minor,
+        is_fully_allocated=r.is_fully_allocated,
+    )
+
+
+@app.post("/tenants/{tenant_id}/payments/{payment_id}/unmatch", response_model=UnmatchOut)
+def unmatch_payment_endpoint(tenant_id: str, payment_id: str) -> UnmatchOut:
+    """Release all bills allocated to this payment so it can be matched again from scratch."""
+    conn = _get_conn()
+    try:
+        load_payment(conn, payment_id)
+    except KeyError:
+        conn.close()
+        raise HTTPException(status_code=404, detail="payment not found")
+
+    try:
+        freed = unmatch_payment(conn, tenant_id=tenant_id, payment_id=payment_id)
+    except ValueError as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail=str(e))
+
+    event_id: str | None = None
+    if freed:
+        cfg = load_tenant_config(conn, tenant_id)
+        event_id = insert_match_event(
+            conn,
+            tenant_id=tenant_id,
+            payment_id=payment_id,
+            bill_ids=list(freed),
+            rules_version=cfg.rules_version,
+            features={"action": "unmatch", "freed_bill_count": len(freed)},
+            decision="manual",
+            outcome="manual_alternative",
+            reason_codes=["user_unmatch"],
+        )
+    conn.close()
+    return UnmatchOut(
+        payment_id=payment_id,
+        freed_bill_ids=list(freed),
+        event_id=event_id,
     )
 
 
@@ -256,10 +334,47 @@ def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
     # When accepted, mark matched_payment_id on bills so they are excluded from future retrieval
     if body.outcome in ("accepted_as_is", "edited_subset"):
         payment_row = conn.execute(
-            "SELECT payment_id FROM match_events WHERE event_id = ?", (event_id,)
+            "SELECT payment_id, tenant_id FROM match_events WHERE event_id = ?", (event_id,)
         ).fetchone()
         pid = payment_row["payment_id"] if payment_row else None
-        if pid:
+        tid = payment_row["tenant_id"] if payment_row else None
+        if pid and tid:
+            cfg = load_tenant_config(conn, tid)
+            alloc = get_payment_allocation(conn, tid, pid)
+            # Sum ledger amounts for bills being added (must not exceed payment total)
+            new_bills = [b for b in corrected_bills if b not in alloc.matched_bill_ids]
+            add_sum = 0
+            for bid in new_bills:
+                brow = conn.execute(
+                    "SELECT open_amount_minor, currency, open_date FROM bills WHERE bill_id = ?",
+                    (bid,),
+                ).fetchone()
+                if brow is None:
+                    continue
+                if brow["currency"] == cfg.ledger_currency:
+                    add_sum += int(brow["open_amount_minor"])
+                else:
+                    from bulk_payments.fx import convert_to_ledger
+
+                    pay = load_payment(conn, pid)
+                    add_sum += convert_to_ledger(
+                        conn,
+                        tenant_id=tid,
+                        amount_minor=int(brow["open_amount_minor"]),
+                        from_currency=brow["currency"],
+                        to_currency=cfg.ledger_currency,
+                        as_of=pay.payment_date,
+                    )[0]
+            total_after = alloc.allocated_sum_minor + add_sum
+            if total_after > alloc.payment_amount_minor + cfg.amount_tolerance_minor:
+                conn.close()
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Cannot allocate ${total_after/100:.2f} to a ${alloc.payment_amount_minor/100:.2f} "
+                        "payment; unmatch existing bills first to change allocation."
+                    ),
+                )
             for bid in corrected_bills:
                 conn.execute(
                     "UPDATE bills SET matched_payment_id = ? WHERE bill_id = ? AND matched_payment_id IS NULL",
