@@ -1,0 +1,239 @@
+/* ── reset / base ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  background: #f5f6fa;
+  color: #1a1a2e;
+}
+
+/* ── app shell ── */
+.app {
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 0 16px 48px;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 20px 0 16px;
+  border-bottom: 1px solid #e0e2ea;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  font-size: 20px;
+  font-weight: 700;
+  margin: 0;
+  flex: 1;
+}
+
+.tenant-select {
+  font-size: 13px;
+  padding: 4px 8px;
+  border: 1px solid #d0d3de;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.tenant-label {
+  font-size: 13px;
+  color: #555;
+}
+
+/* ── errors ── */
+.api-error {
+  background: #fff0f0;
+  border: 1px solid #f5c0c0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+  color: #b00;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.api-error button {
+  margin-left: auto;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #b00;
+  font-size: 15px;
+}
+
+.error-msg { color: #c00; font-size: 13px; margin: 6px 0 0; }
+
+/* ── payment list ── */
+.payment-list { display: flex; flex-direction: column; gap: 16px; }
+
+.empty-state { color: #666; font-size: 14px; }
+
+/* ── match panel ── */
+.match-panel {
+  background: #fff;
+  border: 1px solid #e0e2ea;
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.payment-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.payment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+}
+
+.payment-amount { font-weight: 700; font-size: 16px; }
+.payment-date   { color: #666; font-size: 13px; }
+.payment-counterparty { font-size: 13px; color: #2a4acc; font-weight: 500; }
+.payment-desc   { font-size: 12px; color: #888; font-style: italic; }
+
+/* ── buttons ── */
+.btn-match {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border: none;
+  border-radius: 6px;
+  background: #2a4acc;
+  color: #fff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-match:hover { background: #1e38a0; }
+.btn-match:disabled { opacity: 0.55; cursor: default; }
+
+.btn-accept {
+  padding: 5px 12px;
+  font-size: 13px;
+  border: none;
+  border-radius: 6px;
+  background: #14a651;
+  color: #fff;
+  cursor: pointer;
+}
+.btn-accept:hover { background: #0e7c3c; }
+
+.btn-reject {
+  padding: 5px 12px;
+  font-size: 13px;
+  border: none;
+  border-radius: 6px;
+  background: #e53e3e;
+  color: #fff;
+  cursor: pointer;
+}
+.btn-reject:hover { background: #b52828; }
+
+/* ── badges ── */
+.badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 20px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.badge-auto    { background: #d4edda; color: #155724; }
+.badge-suggest { background: #fff3cd; color: #856404; }
+.badge-none    { background: #f0f0f0; color: #555; }
+
+/* ── result area ── */
+.result-area { padding-top: 4px; }
+
+.result-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.competing-note { font-size: 12px; color: #856404; }
+.prob-note      { font-size: 12px; color: #666; margin-left: auto; }
+
+.reason-codes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.reason-chip {
+  font-size: 11px;
+  background: #f0f2ff;
+  color: #2a4acc;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.no-subsets { color: #888; font-size: 13px; }
+
+/* ── subset cards ── */
+.subset-card {
+  border: 1px solid #e8e9f0;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  background: #fafbff;
+}
+
+.subset-best { border-color: #2a4acc; border-width: 1.5px; }
+
+.subset-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.subset-rank  { font-size: 12px; color: #888; }
+.subset-sum   { font-weight: 700; }
+.residual     { font-size: 12px; color: #856404; margin-left: auto; }
+
+.bill-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.bill-chip {
+  font-size: 11px;
+  font-family: monospace;
+  background: #e8eaf8;
+  color: #2a4acc;
+  border-radius: 4px;
+  padding: 2px 7px;
+}
+
+.feedback-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.feedback-done {
+  font-size: 13px;
+  font-weight: 600;
+  margin-top: 4px;
+}
+.feedback-accepted { color: #14a651; }
+.feedback-rejected { color: #e53e3e; }
