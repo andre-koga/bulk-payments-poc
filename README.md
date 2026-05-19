@@ -97,6 +97,43 @@ python scripts/run_langsmith_eval.py \
     --dataset-name bulk-payments-poc
 ```
 
+## Web UI + API (local)
+
+**Quick start (one command):**
+
+```bash
+./run.sh
+# API: http://127.0.0.1:8000  |  UI: http://localhost:5173
+```
+
+Put secrets in `.env` at the repo root (see `.gitignore`). Options: `./run.sh --help`, `./run.sh --no-seed`, `./run.sh --db /path/to/bulk.db`.
+
+**Manual (two terminals):**
+
+Terminal 1 — API (uses `BULK_DB`, default `/tmp/bulk.db`):
+
+```bash
+export BULK_DB=/tmp/bulk.db
+export OPENAI_API_KEY=sk-...   # required for agent-resolve
+bulk-match seed --db "$BULK_DB"
+pip install -e ".[api,agent]"
+bulk-api
+# or: uvicorn bulk_payments.api:app --reload --port 8000
+```
+
+Terminal 2 — frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+# open http://localhost:5173
+```
+
+In the UI: pick a tenant, **Run match** on a payment, then **Resolve with AI** when the rules engine returns a suggestion or no match. The agent panel shows reasoning, proposed bills, and a LangSmith trace link when tracing is enabled.
+
+Optional: set `VITE_API_URL=http://127.0.0.1:8000` in `frontend/.env` (default).
+
 ## Architecture overview
 
 ```

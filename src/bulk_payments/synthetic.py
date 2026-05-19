@@ -21,12 +21,22 @@ def seed_demo_dataset(conn: sqlite3.Connection) -> dict[str, list[str]]:
     - optional FX payment (rate != 1) if we add EUR bill normalized upstream — here all USD ledger for POC
     """
     init_db(conn)
+    from bulk_payments.db import migrate_db
+
+    migrate_db(conn)
     cur = conn.cursor()
-    cur.execute("DELETE FROM match_events")
-    cur.execute("DELETE FROM payments")
-    cur.execute("DELETE FROM bills")
-    cur.execute("DELETE FROM vendors")
-    cur.execute("DELETE FROM tenants")
+    # Wipe demo data (FK-safe order; disable checks for leftover allocations).
+    cur.execute("PRAGMA foreign_keys = OFF")
+    for table in (
+        "agent_resolutions",
+        "match_events",
+        "bills",
+        "payments",
+        "vendors",
+        "tenants",
+    ):
+        cur.execute(f"DELETE FROM {table}")
+    cur.execute("PRAGMA foreign_keys = ON")
 
     tenants = [
         (

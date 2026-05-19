@@ -19,10 +19,16 @@ agent = [
     "pydantic>=2.0",
     "langgraph>=0.3",
 ]
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.0",
+]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "langchain-community>=0.3"]
 
 [project.scripts]
 bulk-match = "bulk_payments.cli:main"
+bulk-api = "bulk_payments.api_server:main"
 
 [build-system]
 requires = ["hatchling"]
