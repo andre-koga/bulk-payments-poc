@@ -155,13 +155,32 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    if column not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Apply incremental schema updates (idempotent)."""
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_events)").fetchall()}
-    if "accountant_reasoning" not in cols:
-        conn.execute(
-            "ALTER TABLE match_events ADD COLUMN accountant_reasoning TEXT"
-        )
+    _add_column_if_missing(
+        conn, "match_events", "accountant_reasoning", "accountant_reasoning TEXT"
+    )
+    _add_column_if_missing(
+        conn,
+        "tenants",
+        "use_ranker_threshold",
+        "use_ranker_threshold INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn, "payments", "fx_rate_used", "fx_rate_used REAL NOT NULL DEFAULT 1.0"
+    )
+    _add_column_if_missing(conn, "payments", "source_currency", "source_currency TEXT")
 
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     current = int(row["value"]) if row else 0
