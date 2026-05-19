@@ -11,7 +11,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+agent = [
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "langchain-anthropic>=0.3",
+    "langsmith>=0.2",
+    "pydantic>=2.0",
+    "langgraph>=0.3",
+]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "langchain-community>=0.3"]
 
 [project.scripts]
 bulk-match = "bulk_payments.cli:main"
@@ -25,3 +33,6 @@ packages = ["src/bulk_payments"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "integration: live LLM tests, skipped unless API keys are present",
+]

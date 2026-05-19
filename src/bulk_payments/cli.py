@@ -43,6 +43,42 @@ def main(argv: list[str] | None = None) -> int:
     p_label = sub.add_parser("label-demo", help="Apply synthetic labels to latest events for training")
     p_label.add_argument("--db", required=True)
 
+    # AI agent commands -------------------------------------------------------
+    p_ar = sub.add_parser(
+        "agent-resolve",
+        help="Run rules engine + AI resolver for one payment; print JSON result",
+    )
+    p_ar.add_argument("--db", required=True)
+    p_ar.add_argument("--tenant", required=True)
+    p_ar.add_argument("--payment", required=True)
+    p_ar.add_argument("--model", default="gpt-4o-mini", help="LLM model identifier")
+    p_ar.add_argument(
+        "--project",
+        default="bulk-payments-poc",
+        help="LangSmith project name (requires LANGSMITH_API_KEY env var)",
+    )
+
+    p_ae = sub.add_parser(
+        "agent-eval",
+        help="Run AI resolver on oracle cases and compare to ground truth",
+    )
+    p_ae.add_argument("--db", required=True)
+    p_ae.add_argument(
+        "--models",
+        default="gpt-4o-mini",
+        help="Comma-separated list of model IDs to evaluate",
+    )
+    p_ae.add_argument("--project", default="bulk-payments-poc")
+
+    p_ab = sub.add_parser(
+        "agent-batch",
+        help="Run AI resolver on all pending SUGGESTED / NO_CANDIDATES events for a tenant",
+    )
+    p_ab.add_argument("--db", required=True)
+    p_ab.add_argument("--tenant", required=True)
+    p_ab.add_argument("--model", default="gpt-4o-mini")
+    p_ab.add_argument("--project", default="bulk-payments-poc")
+
     args = p.parse_args(argv)
 
     if args.cmd == "init-db":
@@ -93,8 +129,146 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(paths, indent=2))
         return 0
 
+    if args.cmd == "agent-resolve":
+        return _cmd_agent_resolve(args)
+
+    if args.cmd == "agent-eval":
+        return _cmd_agent_eval(args)
+
+    if args.cmd == "agent-batch":
+        return _cmd_agent_batch(args)
+
     return 1
 
+
+# ---------------------------------------------------------------------------
+# Agent command implementations
+# ---------------------------------------------------------------------------
+
+def _cmd_agent_resolve(args) -> int:
+    from bulk_payments.agent.tracing import configure_tracing
+    from bulk_payments.match_with_agent import match_payment_with_agent
+
+    configure_tracing(project=args.project)
+    conn = connect(args.db)
+    result = match_payment_with_agent(
+        conn,
+        tenant_id=args.tenant,
+        payment_id=args.payment,
+        model=args.model,
+    )
+    conn.close()
+    print(json.dumps(_agent_result_to_json(result), indent=2))
+    return 0
+
+
+def _cmd_agent_eval(args) -> int:
+    """Evaluate one or more models against the demo oracle and print a comparison table."""
+    from bulk_payments.agent.tracing import configure_tracing
+    from bulk_payments.evaluation import ORACLE
+    from bulk_payments.match_with_agent import match_payment_with_agent
+    from bulk_payments.synthetic import create_db_with_seed
+
+    configure_tracing(project=args.project)
+    models = [m.strip() for m in args.models.split(",") if m.strip()]
+    conn = connect(args.db)
+
+    results: list[dict] = []
+    for model in models:
+        correct = 0
+        total = 0
+        for payment_id, oracle in ORACLE.items():
+            # Re-seed so previous runs don't affect candidates
+            try:
+                result = match_payment_with_agent(
+                    conn,
+                    tenant_id=_oracle_tenant(payment_id),
+                    payment_id=payment_id,
+                    model=model,
+                )
+            except Exception as exc:
+                print(f"  error for {payment_id}: {exc}", file=sys.stderr)
+                total += 1
+                continue
+
+            agent = result.agent
+            rules_decision = result.rules.decision.value
+            agent_action = agent.action.value if agent else "rules_auto"
+            agent_bills = set(agent.bill_ids) if agent else set(result.rules.subsets[0].bill_ids if result.rules.subsets else [])
+
+            match_ok = _oracle_matches(oracle, rules_decision, agent_action, agent_bills)
+            correct += int(match_ok)
+            total += 1
+
+            status = "PASS" if match_ok else "FAIL"
+            results.append({
+                "model": model,
+                "payment_id": payment_id,
+                "rules_decision": rules_decision,
+                "agent_action": agent_action,
+                "proposed_bills": sorted(agent_bills),
+                "oracle_kind": oracle.kind,
+                "status": status,
+            })
+
+        pct = f"{100 * correct / total:.0f}%" if total else "n/a"
+        print(f"\nModel: {model}  accuracy={correct}/{total} ({pct})")
+
+    conn.close()
+    print()
+    print(json.dumps(results, indent=2))
+    all_pass = all(r["status"] == "PASS" for r in results)
+    return 0 if all_pass else 1
+
+
+def _cmd_agent_batch(args) -> int:
+    """Run the agent on all payments with pending SUGGESTED / NO_CANDIDATES events."""
+    from bulk_payments.agent.tracing import configure_tracing
+    from bulk_payments.match_with_agent import match_payment_with_agent
+
+    configure_tracing(project=args.project)
+    conn = connect(args.db)
+
+    rows = conn.execute(
+        """
+        SELECT DISTINCT me.payment_id
+        FROM match_events me
+        LEFT JOIN agent_resolutions ar ON ar.event_id = me.event_id
+        WHERE me.tenant_id = ?
+          AND me.decision IN ('suggested', 'no_candidates')
+          AND me.outcome = 'pending'
+          AND ar.resolution_id IS NULL
+        ORDER BY me.created_at ASC
+        """,
+        (args.tenant,),
+    ).fetchall()
+
+    payment_ids = [r["payment_id"] for r in rows]
+    print(f"Found {len(payment_ids)} pending payment(s) to resolve.")
+
+    resolved = []
+    for pid in payment_ids:
+        try:
+            result = match_payment_with_agent(
+                conn,
+                tenant_id=args.tenant,
+                payment_id=pid,
+                model=args.model,
+            )
+            resolved.append(_agent_result_to_json(result))
+            action = result.agent.action.value if result.agent else "skipped"
+            print(f"  {pid}: {action}")
+        except Exception as exc:
+            print(f"  {pid}: ERROR — {exc}", file=sys.stderr)
+
+    conn.close()
+    print(json.dumps(resolved, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _result_to_json(r):
     return {
@@ -112,6 +286,51 @@ def _result_to_json(r):
         ],
         "features": r.features,
     }
+
+
+def _agent_result_to_json(result) -> dict:
+    rules = result.rules
+    agent = result.agent
+    out = {
+        "payment_id": rules.payment_id,
+        "tenant_id": rules.tenant_id,
+        "event_id": result.event_id,
+        "resolution_id": result.resolution_id,
+        "rules": {
+            "decision": rules.decision.value,
+            "reason_codes": list(rules.reason_codes),
+            "competing_subset_count": rules.competing_subset_count,
+        },
+        "agent": None,
+    }
+    if agent:
+        out["agent"] = {
+            "action": agent.action.value,
+            "bill_ids": agent.bill_ids,
+            "confidence": agent.confidence,
+            "reasoning": agent.reasoning,
+            "model_id": agent.model_id,
+            "langsmith_run_id": agent.langsmith_run_id,
+        }
+    return out
+
+
+def _oracle_tenant(payment_id: str) -> str:
+    """Map oracle payment_ids to their tenant (matches synthetic.py seed data)."""
+    return "t2" if payment_id == "pay_t2_ok" else "t1"
+
+
+def _oracle_matches(oracle, rules_decision: str, agent_action: str, agent_bills: set) -> bool:
+    from bulk_payments.evaluation import OracleCase
+
+    if oracle.kind == "none":
+        return agent_action == "no_match"
+    if oracle.kind == "suggest":
+        # Agent should not return no_match for a payment that has valid (ambiguous) subsets
+        return agent_action in ("propose_match", "need_more_info")
+    if oracle.kind == "exact":
+        return agent_action == "propose_match" and agent_bills == oracle.bills
+    return False
 
 
 if __name__ == "__main__":
