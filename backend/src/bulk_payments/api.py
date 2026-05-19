@@ -9,11 +9,11 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from bulk_payments.allocation import apply_accepted_bills, get_payment_allocation, unmatch_payment
 from bulk_payments.batch import run_batch_auto_match
-from bulk_payments.db import connect, insert_match_event, init_db
+from bulk_payments.db import connect, insert_match_event, init_db, migrate_db
 from bulk_payments.evaluation import extended_eval_report
 from bulk_payments.matcher import match_payment
 from bulk_payments.synthetic import (
@@ -22,12 +22,13 @@ from bulk_payments.synthetic import (
     load_tenant_config,
     load_vendors,
 )
-from bulk_payments.models import OutcomeLabel
+from bulk_payments.models import DecisionKind, OutcomeLabel
 
 DB_PATH = os.environ.get("BULK_DB", "/tmp/bulk.db")
 RANKER_PATH = os.environ.get("BULK_RANKER", None)
+DEFAULT_AGENT_MODEL = os.environ.get("BULK_AGENT_MODEL", "gpt-4o-mini")
 
-app = FastAPI(title="Bulk Payment Matcher API", version="0.1.0")
+app = FastAPI(title="Bulk Payment Matcher API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,6 +41,7 @@ app.add_middleware(
 def _get_conn() -> sqlite3.Connection:
     conn = connect(DB_PATH)
     init_db(conn)
+    migrate_db(conn)
     return conn
 
 
@@ -97,6 +99,29 @@ class BillOut(BaseModel):
     open_date: str
     due_date: str | None
     matched_payment_id: str | None
+
+
+class AgentResolutionOut(BaseModel):
+    action: str
+    bill_ids: list[str]
+    confidence: float
+    reasoning: str
+    model_id: str
+    langsmith_run_id: str | None = None
+    langsmith_trace_url: str | None = None
+
+
+class AgentResolveIn(BaseModel):
+    model: str = Field(default_factory=lambda: DEFAULT_AGENT_MODEL)
+
+
+class MatchWithAgentOut(BaseModel):
+    payment_id: str
+    tenant_id: str
+    event_id: str
+    resolution_id: str | None
+    rules: MatchResultOut
+    agent: AgentResolutionOut | None
 
 
 class OutcomeIn(BaseModel):
@@ -188,6 +213,32 @@ def _latest_event_for_payment(conn: sqlite3.Connection, payment_id: str) -> str 
 
 # ---------- endpoints ----------
 
+
+
+def _langsmith_trace_url(run_id: str | None) -> str | None:
+    if not run_id:
+        return None
+    project = os.environ.get("LANGSMITH_PROJECT", "bulk-payments-poc")
+    return f"https://smith.langchain.com/o/default/projects/p/{project}/r/{run_id}"
+
+
+def _agent_resolution_out(agent) -> "AgentResolutionOut":
+    run_id = agent.langsmith_run_id
+    return AgentResolutionOut(
+        action=agent.action.value,
+        bill_ids=list(agent.bill_ids),
+        confidence=agent.confidence,
+        reasoning=agent.reasoning,
+        model_id=agent.model_id,
+        langsmith_run_id=run_id,
+        langsmith_trace_url=_langsmith_trace_url(run_id),
+    )
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/tenants")
 def list_tenants() -> list[dict[str, Any]]:
     conn = _get_conn()
@@ -272,6 +323,88 @@ def run_match(tenant_id: str, payment_id: str) -> MatchResultOut:
     out = _match_result_out(conn, tenant_id, r, event_id)
     conn.close()
     return out
+
+
+@app.post(
+    "/tenants/{tenant_id}/payments/{payment_id}/agent-resolve",
+    response_model=MatchWithAgentOut,
+)
+def agent_resolve(
+    tenant_id: str,
+    payment_id: str,
+    body: AgentResolveIn | None = None,
+) -> MatchWithAgentOut:
+    """Run rules engine + AI resolver; persist match_event and agent_resolution."""
+    try:
+        from bulk_payments.match_with_agent import match_payment_with_agent
+    except ImportError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent dependencies not installed. Run: pip install -e '.[agent,api]'",
+        ) from e
+
+    model = (body.model if body else None) or DEFAULT_AGENT_MODEL
+    conn = _get_conn()
+    try:
+        combined = match_payment_with_agent(
+            conn,
+            tenant_id=tenant_id,
+            payment_id=payment_id,
+            ranker_path=RANKER_PATH,
+            model=model,
+        )
+    except KeyError as e:
+        conn.close()
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        conn.close()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    rules_out = _match_result_out(conn, tenant_id, combined.rules, combined.event_id)
+    agent_out = _agent_resolution_out(combined.agent) if combined.agent else None
+    conn.close()
+    return MatchWithAgentOut(
+        payment_id=payment_id,
+        tenant_id=tenant_id,
+        event_id=combined.event_id,
+        resolution_id=combined.resolution_id,
+        rules=rules_out,
+        agent=agent_out,
+    )
+
+
+@app.get(
+    "/tenants/{tenant_id}/payments/{payment_id}/agent-resolution/latest",
+    response_model=AgentResolutionOut | None,
+)
+def latest_agent_resolution(tenant_id: str, payment_id: str) -> AgentResolutionOut | None:
+    """Return the most recent agent resolution for this payment, if any."""
+    conn = _get_conn()
+    row = conn.execute(
+        """
+        SELECT ar.* FROM agent_resolutions ar
+        JOIN match_events me ON me.event_id = ar.event_id
+        WHERE me.tenant_id = ? AND me.payment_id = ?
+        ORDER BY ar.created_at DESC LIMIT 1
+        """,
+        (tenant_id, payment_id),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    run_id = row["langsmith_run_id"]
+    return AgentResolutionOut(
+        action=row["action"],
+        bill_ids=json.loads(row["bill_ids_json"]),
+        confidence=row["confidence"],
+        reasoning=row["reasoning"],
+        model_id=row["model_id"],
+        langsmith_run_id=run_id,
+        langsmith_trace_url=_langsmith_trace_url(run_id),
+    )
 
 
 @app.post("/tenants/{tenant_id}/payments/{payment_id}/unmatch", response_model=UnmatchOut)

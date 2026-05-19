@@ -1,7 +1,10 @@
-import { useEffect, useMemo, useReducer, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   api,
+  type AgentResolution,
   type BatchAutoMatchResponse,
+  type Bill,
   type MatchResult,
   type Payment,
   type Tenant,
@@ -12,6 +15,12 @@ type MatchState =
   | { kind: "idle" }
   | { kind: "loading" }
   | { kind: "result"; data: MatchResult }
+  | { kind: "error"; message: string };
+
+type AgentState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "result"; data: AgentResolution; eventId: string }
   | { kind: "error"; message: string };
 
 /** Per-payment review state (not keyed by event_id — each Run match starts a new event). */
@@ -116,6 +125,111 @@ const initialState: State = {
   feedback: {},
 };
 
+function BillDetailsBody({ bill, billId }: { bill: Bill | undefined; billId: string }) {
+  if (!bill) {
+    return (
+      <p className="bill-popover-missing">
+        No row loaded for <strong>{billId}</strong>
+      </p>
+    );
+  }
+  return (
+    <dl className="bill-popover-dl">
+      <div>
+        <dt>Vendor</dt>
+        <dd>
+          {bill.vendor_name}
+          <span className="bill-popover-muted"> ({bill.vendor_id})</span>
+        </dd>
+      </div>
+      <div>
+        <dt>Open amount</dt>
+        <dd>
+          {bill.amount_display} {bill.currency}
+        </dd>
+      </div>
+      <div>
+        <dt>Open date</dt>
+        <dd>{bill.open_date}</dd>
+      </div>
+      <div>
+        <dt>Due date</dt>
+        <dd>{bill.due_date ?? "—"}</dd>
+      </div>
+      <div>
+        <dt>Status</dt>
+        <dd>
+          {bill.matched_payment_id
+            ? `Matched to ${bill.matched_payment_id}`
+            : "Open (unmatched)"}
+        </dd>
+      </div>
+    </dl>
+  );
+}
+
+function BillTag({
+  billId,
+  billsById,
+  className = "bill-chip",
+}: {
+  billId: string;
+  billsById: Record<string, Bill>;
+  className?: string;
+}) {
+  const anchorRef = useRef<HTMLElement>(null);
+  const [open, setOpen] = useState(false);
+  const [coords, setCoords] = useState({ top: 0, left: 0 });
+
+  const bill = billsById[billId];
+
+  const updatePosition = () => {
+    const el = anchorRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setCoords({ top: r.bottom + 6, left: r.left });
+  };
+
+  const show = () => {
+    updatePosition();
+    setOpen(true);
+  };
+
+  const hide = () => setOpen(false);
+
+  return (
+    <>
+      <code
+        ref={anchorRef}
+        className={className}
+        tabIndex={0}
+        onMouseEnter={show}
+        onMouseLeave={hide}
+        onFocus={show}
+        onBlur={hide}
+        aria-describedby={open ? `bill-popover-${billId}` : undefined}
+      >
+        {billId}
+      </code>
+      {open &&
+        createPortal(
+          <div
+            id={`bill-popover-${billId}`}
+            className="bill-popover"
+            style={{ top: coords.top, left: coords.left }}
+            role="tooltip"
+            onMouseEnter={show}
+            onMouseLeave={hide}
+          >
+            <div className="bill-popover-header">{billId}</div>
+            <BillDetailsBody bill={bill} billId={billId} />
+          </div>,
+          document.body
+        )}
+    </>
+  );
+}
+
 function decisionBadge(decision: MatchResult["decision"]) {
   const map: Record<string, { label: string; cls: string }> = {
     auto_applied: { label: "Auto-applied", cls: "badge badge-auto" },
@@ -139,6 +253,19 @@ type PendingReviewAction =
 
 function needsExpertReasoning(data: MatchResult) {
   return data.decision === "suggested" || data.competing_subset_count > 1;
+}
+
+function needsAgentReview(data: MatchResult) {
+  return data.decision === "suggested" || data.decision === "no_candidates";
+}
+
+function agentActionLabel(action: AgentResolution["action"]) {
+  const map: Record<AgentResolution["action"], string> = {
+    propose_match: "Proposes allocation",
+    no_match: "No match",
+    need_more_info: "Needs more info",
+  };
+  return map[action] ?? action;
 }
 
 function AutoMatchBar({
@@ -190,17 +317,22 @@ function MatchPanel({
   matchState,
   paymentFeedback,
   expertReview,
+  billsById,
   onRunMatch,
   onAcceptTop,
   onRejectTop,
   onAcceptAlternate,
   onUnmatch,
   unmatchLoading,
+  agentState,
+  onRunAgent,
+  onAcceptAgent,
 }: {
   payment: Payment;
   matchState: MatchState;
   paymentFeedback: PaymentFeedback | undefined;
   expertReview: boolean;
+  billsById: Record<string, Bill>;
   onRunMatch: () => void;
   onAcceptTop: (eventId: string, billIds: string[], reasoning?: string) => void;
   onRejectTop: (eventId: string, reasoning?: string) => void;
@@ -212,6 +344,9 @@ function MatchPanel({
   ) => void;
   onUnmatch: () => void;
   unmatchLoading: boolean;
+  agentState: AgentState;
+  onRunAgent: () => void;
+  onAcceptAgent: (eventId: string, billIds: string[]) => void;
 }) {
   const [pendingAction, setPendingAction] = useState<PendingReviewAction | null>(null);
   const [reasoning, setReasoning] = useState("");
@@ -315,22 +450,34 @@ function MatchPanel({
             <span className="payment-desc">"{payment.description}"</span>
           )}
         </div>
-        <button
-          className="btn-match"
-          onClick={onRunMatch}
-          disabled={matchState.kind === "loading" || fullyAllocated}
-          title={
-            fullyAllocated
-              ? "Payment amount is already fully covered by allocated bills"
-              : undefined
-          }
-        >
-          {matchState.kind === "loading"
-            ? "Matching…"
-            : hasAllocation
-              ? "Match remaining amount"
-              : "Run match"}
-        </button>
+        <div className="payment-actions">
+          <button
+            className="btn-match"
+            onClick={onRunMatch}
+            disabled={matchState.kind === "loading" || fullyAllocated}
+            title={
+              fullyAllocated
+                ? "Payment amount is already fully covered by allocated bills"
+                : undefined
+            }
+          >
+            {matchState.kind === "loading"
+              ? "Matching…"
+              : hasAllocation
+                ? "Match remaining amount"
+                : "Run match"}
+          </button>
+          {matchState.kind === "result" && needsAgentReview(matchState.data) && (
+            <button
+              type="button"
+              className="btn-agent"
+              onClick={onRunAgent}
+              disabled={agentState.kind === "loading"}
+            >
+              {agentState.kind === "loading" ? "AI resolving…" : "Resolve with AI"}
+            </button>
+          )}
+        </div>
       </div>
 
       {hasAllocation && (
@@ -340,7 +487,7 @@ function MatchPanel({
           </span>
           <span className="settled-label">Allocated:</span>
           {matchedBillIds.map((id) => (
-            <code key={id} className="bill-chip">{id}</code>
+            <BillTag key={id} billId={id} billsById={billsById} />
           ))}
           <span className="settled-hint">
             ${(allocatedMinor / 100).toFixed(2)} of {payment.amount_display} allocated.
@@ -503,7 +650,9 @@ function MatchPanel({
                 </div>
                 <ul className="bill-list">
                   {subset.bill_ids.map((bid) => (
-                    <li key={bid} className="bill-chip">{bid}</li>
+                    <li key={bid}>
+                      <BillTag billId={bid} billsById={billsById} />
+                    </li>
                   ))}
                 </ul>
 
@@ -547,6 +696,54 @@ function MatchPanel({
           })}
             </div>
           )}
+
+      {agentState.kind === "error" && (
+        <p className="error-msg">AI error: {agentState.message}</p>
+      )}
+
+      {agentState.kind === "result" && (
+        <div className="agent-panel">
+          <div className="agent-panel-header">
+            <span className="badge badge-agent">AI resolution</span>
+            <span className="agent-action">{agentActionLabel(agentState.data.action)}</span>
+            <span className="agent-confidence">
+              {(agentState.data.confidence * 100).toFixed(0)}% confidence
+            </span>
+            <span className="agent-model">{agentState.data.model_id}</span>
+          </div>
+          <p className="agent-reasoning">{agentState.data.reasoning}</p>
+          {agentState.data.bill_ids.length > 0 && (
+            <div className="agent-bills">
+              {agentState.data.bill_ids.map((id) => (
+                <BillTag key={id} billId={id} billsById={billsById} />
+              ))}
+            </div>
+          )}
+          {agentState.data.action === "propose_match" &&
+            agentState.data.bill_ids.length > 0 &&
+            eventId && (
+              <div className="feedback-row">
+                <button
+                  type="button"
+                  className="btn-accept"
+                  onClick={() => onAcceptAgent(eventId, agentState.data.bill_ids)}
+                >
+                  Accept AI suggestion
+                </button>
+              </div>
+            )}
+          {agentState.data.langsmith_trace_url && (
+            <a
+              className="langsmith-link"
+              href={agentState.data.langsmith_trace_url}
+              target="_blank"
+              rel="noreferrer"
+            >
+              View trace in LangSmith
+            </a>
+          )}
+        </div>
+      )}
         </div>
       )}
     </div>
@@ -562,6 +759,12 @@ export default function App() {
     null
   );
   const [expertReviewIds, setExpertReviewIds] = useState<Set<string>>(new Set());
+  const [autoMatchedIds, setAutoMatchedIds] = useState<Set<string>>(new Set());
+  const [noMatchIds, setNoMatchIds] = useState<Set<string>>(new Set());
+  const [agentByPayment, setAgentByPayment] = useState<Record<string, AgentState>>({});
+  const [billsById, setBillsById] = useState<Record<string, Bill>>({});
+
+  const agentModel = import.meta.env.VITE_AGENT_MODEL ?? "gpt-4o-mini";
 
   useEffect(() => {
     api
@@ -573,14 +776,28 @@ export default function App() {
       .catch((e) => setApiError(String(e)));
   }, []);
 
+  const loadBills = (tenantId: string) =>
+    api
+      .listBills(tenantId, false)
+      .then((bills) => {
+        const map: Record<string, Bill> = {};
+        for (const b of bills) map[b.bill_id] = b;
+        setBillsById(map);
+      })
+      .catch((e) => setApiError(String(e)));
+
   useEffect(() => {
     if (!state.selectedTenant) return;
     setBatchSummary(null);
     setExpertReviewIds(new Set());
+    setAutoMatchedIds(new Set());
+    setNoMatchIds(new Set());
+    setBillsById({});
     api
       .listPayments(state.selectedTenant)
       .then((ps) => dispatch({ type: "SET_PAYMENTS", payments: ps }))
       .catch((e) => setApiError(String(e)));
+    loadBills(state.selectedTenant);
   }, [state.selectedTenant]);
 
   const openPaymentCount = useMemo(
@@ -588,23 +805,37 @@ export default function App() {
     [state.payments]
   );
 
+  const paymentSortTier = (paymentId: string): number => {
+    if (expertReviewIds.has(paymentId)) return 0;
+    if (autoMatchedIds.has(paymentId)) return 1;
+    if (noMatchIds.has(paymentId)) return 3;
+    return 2;
+  };
+
   const sortedPayments = useMemo(() => {
     return [...state.payments].sort((a, b) => {
-      const aExpert = expertReviewIds.has(a.payment_id) ? 0 : 1;
-      const bExpert = expertReviewIds.has(b.payment_id) ? 0 : 1;
-      if (aExpert !== bExpert) return aExpert - bExpert;
+      if (batchSummary) {
+        const tierDiff = paymentSortTier(a.payment_id) - paymentSortTier(b.payment_id);
+        if (tierDiff !== 0) return tierDiff;
+      } else {
+        const aExpert = expertReviewIds.has(a.payment_id) ? 0 : 1;
+        const bExpert = expertReviewIds.has(b.payment_id) ? 0 : 1;
+        if (aExpert !== bExpert) return aExpert - bExpert;
+      }
       return a.payment_date.localeCompare(b.payment_date);
     });
-  }, [state.payments, expertReviewIds]);
+  }, [state.payments, expertReviewIds, autoMatchedIds, noMatchIds, batchSummary]);
 
   const isFullyAllocated = (payment: Payment) =>
     payment.settlement?.is_fully_allocated === true;
 
   const refreshPayments = () => {
     if (!state.selectedTenant) return Promise.resolve();
+    const tenantId = state.selectedTenant;
     return api
-      .listPayments(state.selectedTenant)
-      .then((ps) => dispatch({ type: "SET_PAYMENTS", payments: ps }));
+      .listPayments(tenantId)
+      .then((ps) => dispatch({ type: "SET_PAYMENTS", payments: ps }))
+      .then(() => loadBills(tenantId));
   };
 
   const handleRunMatch = (payment: Payment) => {
@@ -686,8 +917,9 @@ export default function App() {
       .autoMatchAll(state.selectedTenant)
       .then((res) => {
         setBatchSummary(res.summary);
-        const reviewIds = new Set(res.needs_review.map((m) => m.payment_id));
-        setExpertReviewIds(reviewIds);
+        setExpertReviewIds(new Set(res.needs_review.map((m) => m.payment_id)));
+        setAutoMatchedIds(new Set(res.auto_matched.map((m) => m.payment_id)));
+        setNoMatchIds(new Set(res.no_match.map((m) => m.payment_id)));
         res.needs_review.forEach((m) => {
           dispatch({ type: "MATCH_RESULT", paymentId: m.payment_id, data: m });
         });
@@ -695,6 +927,47 @@ export default function App() {
       })
       .catch((e) => setApiError(String(e)))
       .finally(() => setBatchLoading(false));
+  };
+
+  const handleRunAgent = (payment: Payment) => {
+    if (!state.selectedTenant) return;
+    const pid = payment.payment_id;
+    setAgentByPayment((prev) => ({ ...prev, [pid]: { kind: "loading" } }));
+    api
+      .runAgentResolve(state.selectedTenant, pid, agentModel)
+      .then((res) => {
+        dispatch({ type: "MATCH_RESULT", paymentId: pid, data: res.rules });
+        if (res.agent) {
+          setAgentByPayment((prev) => ({
+            ...prev,
+            [pid]: { kind: "result", data: res.agent!, eventId: res.event_id },
+          }));
+          if (res.rules.decision === "suggested" || res.rules.decision === "no_candidates") {
+            setExpertReviewIds((prev) => new Set(prev).add(pid));
+          }
+        } else {
+          setAgentByPayment((prev) => ({ ...prev, [pid]: { kind: "idle" } }));
+        }
+      })
+      .catch((e) =>
+        setAgentByPayment((prev) => ({
+          ...prev,
+          [pid]: { kind: "error", message: String(e) },
+        }))
+      );
+  };
+
+  const handleAcceptAgent = (
+    paymentId: string,
+    eventId: string,
+    billIds: string[],
+    reasoning?: string
+  ) => {
+    const agent = agentByPayment[paymentId];
+    const agentReasoning =
+      reasoning ??
+      (agent?.kind === "result" ? agent.data.reasoning : undefined);
+    handleAcceptTop(paymentId, eventId, billIds, agentReasoning);
   };
 
   const handleUnmatch = (payment: Payment) => {
@@ -768,6 +1041,7 @@ export default function App() {
             matchState={state.match[payment.payment_id] ?? { kind: "idle" }}
             paymentFeedback={state.feedback[payment.payment_id]}
             expertReview={expertReviewIds.has(payment.payment_id)}
+            billsById={billsById}
             onRunMatch={() => handleRunMatch(payment)}
             onAcceptTop={(eid, bills, reasoning) =>
               handleAcceptTop(payment.payment_id, eid, bills, reasoning)
@@ -780,6 +1054,11 @@ export default function App() {
             }
             onUnmatch={() => handleUnmatch(payment)}
             unmatchLoading={unmatchLoadingId === payment.payment_id}
+            agentState={agentByPayment[payment.payment_id] ?? { kind: "idle" }}
+            onRunAgent={() => handleRunAgent(payment)}
+            onAcceptAgent={(eid, bills) =>
+              handleAcceptAgent(payment.payment_id, eid, bills)
+            }
           />
         ))}
       </main>

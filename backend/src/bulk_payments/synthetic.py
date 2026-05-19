@@ -28,12 +28,25 @@ def _gbp_minor(pounds: float) -> int:
 
 def seed_demo_dataset(conn: sqlite3.Connection) -> dict[str, list[str]]:
     init_db(conn)
+    from bulk_payments.db import migrate_db
+
+    migrate_db(conn)
     cur = conn.cursor()
-    for table in ("match_events", "payments", "bills", "vendors", "fx_rates", "tenants"):
+    cur.execute("PRAGMA foreign_keys = OFF")
+    for table in (
+        "agent_resolutions",
+        "match_events",
+        "bills",
+        "payments",
+        "vendors",
+        "fx_rates",
+        "tenants",
+    ):
         try:
             cur.execute(f"DELETE FROM {table}")
         except sqlite3.OperationalError:
             pass
+    cur.execute("PRAGMA foreign_keys = ON")
 
     tenants = [
         # t1: dense AR ledger — wide window, many overlapping bills (stress / ambiguity)

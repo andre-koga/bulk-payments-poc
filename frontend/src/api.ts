@@ -81,6 +81,25 @@ export interface BatchAutoMatchResponse {
   no_match: Array<{ payment_id: string; status: string; decision: string }>;
 }
 
+export interface AgentResolution {
+  action: "propose_match" | "no_match" | "need_more_info";
+  bill_ids: string[];
+  confidence: number;
+  reasoning: string;
+  model_id: string;
+  langsmith_run_id: string | null;
+  langsmith_trace_url: string | null;
+}
+
+export interface MatchWithAgentResult {
+  payment_id: string;
+  tenant_id: string;
+  event_id: string;
+  resolution_id: string | null;
+  rules: MatchResult;
+  agent: AgentResolution | null;
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
@@ -132,5 +151,19 @@ export const api = {
     apiFetch<{ payment_id: string; freed_bill_ids: string[]; event_id: string | null }>(
       `/tenants/${tenantId}/payments/${paymentId}/unmatch`,
       { method: "POST" }
+    ),
+
+  runAgentResolve: (tenantId: string, paymentId: string, model = "gpt-4o-mini") =>
+    apiFetch<MatchWithAgentResult>(
+      `/tenants/${tenantId}/payments/${paymentId}/agent-resolve`,
+      {
+        method: "POST",
+        body: JSON.stringify({ model }),
+      }
+    ),
+
+  latestAgentResolution: (tenantId: string, paymentId: string) =>
+    apiFetch<AgentResolution | null>(
+      `/tenants/${tenantId}/payments/${paymentId}/agent-resolution/latest`
     ),
 };

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA foreign_keys = ON;
@@ -95,6 +95,44 @@ CREATE INDEX IF NOT EXISTS idx_match_events_tenant_time
   ON match_events(tenant_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_match_events_payment
   ON match_events(payment_id);
+
+-- AI agent resolution log (schema v2)
+-- One row per agent invocation; linked to match_events via event_id FK.
+CREATE TABLE IF NOT EXISTS agent_resolutions (
+  resolution_id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL REFERENCES match_events(event_id),
+  model_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  bill_ids_json TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  reasoning TEXT NOT NULL,
+  langsmith_run_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_resolutions_event
+  ON agent_resolutions(event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_resolutions_model
+  ON agent_resolutions(model_id);
+"""
+
+_MIGRATION_V2 = """
+CREATE TABLE IF NOT EXISTS agent_resolutions (
+  resolution_id TEXT PRIMARY KEY,
+  event_id TEXT NOT NULL REFERENCES match_events(event_id),
+  model_id TEXT NOT NULL,
+  action TEXT NOT NULL,
+  bill_ids_json TEXT NOT NULL,
+  confidence REAL NOT NULL,
+  reasoning TEXT NOT NULL,
+  langsmith_run_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_resolutions_event
+  ON agent_resolutions(event_id);
+CREATE INDEX IF NOT EXISTS idx_agent_resolutions_model
+  ON agent_resolutions(model_id);
 """
 
 
@@ -117,12 +155,46 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, definition: str
+) -> None:
+    if column not in _table_columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_events)").fetchall()}
-    if "accountant_reasoning" not in cols:
+    """Apply incremental schema updates (idempotent)."""
+    _add_column_if_missing(
+        conn, "match_events", "accountant_reasoning", "accountant_reasoning TEXT"
+    )
+    _add_column_if_missing(
+        conn,
+        "tenants",
+        "use_ranker_threshold",
+        "use_ranker_threshold INTEGER NOT NULL DEFAULT 0",
+    )
+    _add_column_if_missing(
+        conn, "payments", "fx_rate_used", "fx_rate_used REAL NOT NULL DEFAULT 1.0"
+    )
+    _add_column_if_missing(conn, "payments", "source_currency", "source_currency TEXT")
+
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    current = int(row["value"]) if row else 0
+    if current < 2:
+        conn.executescript(_MIGRATION_V2)
         conn.execute(
-            "ALTER TABLE match_events ADD COLUMN accountant_reasoning TEXT"
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')"
         )
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Public migration entry (also called from match_with_agent)."""
+    _migrate(conn)
+    conn.commit()
 
 
 def insert_match_event(
@@ -189,3 +261,40 @@ def update_match_event_outcome(
         (outcome, user_id, event_id),
     )
     conn.commit()
+
+
+def insert_agent_resolution(
+    conn: sqlite3.Connection,
+    *,
+    event_id: str,
+    model_id: str,
+    action: str,
+    bill_ids: list[str],
+    confidence: float,
+    reasoning: str,
+    langsmith_run_id: str | None = None,
+) -> str:
+    """Persist an AI agent resolution linked to a match_event row."""
+    resolution_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO agent_resolutions(
+          resolution_id, event_id, model_id, action,
+          bill_ids_json, confidence, reasoning, langsmith_run_id, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            resolution_id,
+            event_id,
+            model_id,
+            action,
+            json.dumps(bill_ids),
+            confidence,
+            reasoning,
+            langsmith_run_id,
+            now,
+        ),
+    )
+    conn.commit()
+    return resolution_id

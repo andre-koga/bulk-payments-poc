@@ -285,6 +285,70 @@ body {
   padding: 2px 7px;
 }
 
+.bill-chip:focus-visible {
+  outline: 2px solid #6b4fc7;
+  outline-offset: 1px;
+}
+
+.bill-popover {
+  position: fixed;
+  z-index: 10000;
+  min-width: 220px;
+  max-width: 300px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #c5c9d8;
+  background: #fff;
+  box-shadow: 0 8px 24px rgba(20, 24, 40, 0.18);
+  font-size: 12px;
+  line-height: 1.45;
+  pointer-events: auto;
+}
+
+.bill-popover-header {
+  font-family: monospace;
+  font-weight: 700;
+  font-size: 13px;
+  color: #2a4acc;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #e8eaf8;
+}
+
+.bill-popover-dl {
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.bill-popover-dl > div {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 4px 8px;
+  align-items: baseline;
+}
+
+.bill-popover-dl dt {
+  margin: 0;
+  font-weight: 600;
+  color: #555;
+}
+
+.bill-popover-dl dd {
+  margin: 0;
+  color: #1a1a2e;
+}
+
+.bill-popover-muted {
+  color: #888;
+  font-size: 11px;
+}
+
+.bill-popover-missing {
+  margin: 0;
+  color: #666;
+}
+
 .feedback-row {
   display: flex;
   gap: 8px;
@@ -462,4 +526,80 @@ body {
 .subset-chosen {
   border-color: #14a651;
   background: #f1faf4;
+}
+
+/* ── payment actions + AI agent ── */
+.payment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.btn-agent {
+  padding: 6px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid #6b4fc7;
+  border-radius: 6px;
+  background: #f3efff;
+  color: #4a2d9a;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn-agent:hover { background: #e8e0ff; }
+.btn-agent:disabled { opacity: 0.55; cursor: default; }
+
+.badge-agent {
+  background: #ede7ff;
+  color: #4a2d9a;
+  border: 1px solid #c9b8f5;
+}
+
+.agent-panel {
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid #d4c4f7;
+  background: linear-gradient(180deg, #faf8ff 0%, #fff 100%);
+}
+
+.agent-panel-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.agent-action {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.agent-confidence,
+.agent-model {
+  font-size: 12px;
+  color: #666;
+}
+
+.agent-reasoning {
+  margin: 0 0 10px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.agent-bills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.langsmith-link {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #2a4acc;
 }
