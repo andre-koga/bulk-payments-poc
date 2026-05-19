@@ -32,6 +32,9 @@ class TenantConfig:
     max_auto_amount_minor: int | None = 10_000_000_000  # cap in minor units; None = no cap
     max_auto_bill_count: int = 50
     rules_version: str = "v1"
+    # When True, the calibrated ranker probability must meet PolicyConfig.tau_auto.
+    # Leave False at cold start; flip to True once per-tenant precision is validated >= 95%.
+    use_ranker_threshold: bool = False
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,9 @@ class MatchResult:
     features: dict[str, Any] = field(default_factory=dict)
     ranker_score: float | None = None
     calibrated_accept_prob: float | None = None
+    allocated_sum_minor: int = 0
+    remaining_minor: int | None = None
+    is_fully_allocated: bool = False
 
 
 @dataclass(frozen=True)

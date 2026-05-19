@@ -12,7 +12,7 @@ def _rb(bid: str, amt: int) -> RetrievedBill:
         currency="USD",
         open_date=__import__("datetime").date(2025, 1, 1),
     )
-    return RetrievedBill(bill=b, vendor_link_score=1.0, date_delta_days=0)
+    return RetrievedBill(bill=b, vendor_link_score=1.0, date_delta_days=0, ledger_amount_minor=amt, fx_rate_used=1.0)
 
 
 def test_brute_force_unique_subset():

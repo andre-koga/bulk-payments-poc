@@ -3,25 +3,29 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from datetime import date
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from bulk_payments.allocation import (
-    apply_accepted_bills,
-    get_payment_allocation,
-    unmatch_payment,
-)
+from bulk_payments.allocation import apply_accepted_bills, get_payment_allocation, unmatch_payment
 from bulk_payments.batch import run_batch_auto_match
-from bulk_payments.db import connect, init_db, insert_match_event, migrate_db
+from bulk_payments.db import connect, insert_match_event, init_db, migrate_db
+from bulk_payments.evaluation import extended_eval_report
 from bulk_payments.matcher import match_payment
-from bulk_payments.models import DecisionKind, MatchResult, OutcomeLabel
-from bulk_payments.synthetic import load_tenant_config, load_vendors
+from bulk_payments.synthetic import (
+    load_bills,
+    load_payment,
+    load_tenant_config,
+    load_vendors,
+)
+from bulk_payments.models import DecisionKind, OutcomeLabel
 
 DB_PATH = os.environ.get("BULK_DB", "/tmp/bulk.db")
-RANKER_PATH = os.environ.get("BULK_RANKER")
+RANKER_PATH = os.environ.get("BULK_RANKER", None)
 DEFAULT_AGENT_MODEL = os.environ.get("BULK_AGENT_MODEL", "gpt-4o-mini")
 
 app = FastAPI(title="Bulk Payment Matcher API", version="0.2.0")
@@ -41,19 +45,7 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
-def _fmt_minor(minor: int, currency: str = "USD") -> str:
-    return f"{currency} {minor / 100:.2f}"
-
-
-def _langsmith_trace_url(run_id: str | None) -> str | None:
-    if not run_id:
-        return None
-    project = os.environ.get("LANGSMITH_PROJECT", "bulk-payments-poc")
-    return f"https://smith.langchain.com/o/default/projects/p/{project}/r/{run_id}"
-
-
-# ---------- response models ----------
-
+# ---------- response shapes ----------
 
 class SubsetOut(BaseModel):
     bill_ids: list[str]
@@ -109,8 +101,31 @@ class BillOut(BaseModel):
     matched_payment_id: str | None
 
 
+class AgentResolutionOut(BaseModel):
+    action: str
+    bill_ids: list[str]
+    confidence: float
+    reasoning: str
+    model_id: str
+    langsmith_run_id: str | None = None
+    langsmith_trace_url: str | None = None
+
+
+class AgentResolveIn(BaseModel):
+    model: str = Field(default_factory=lambda: DEFAULT_AGENT_MODEL)
+
+
+class MatchWithAgentOut(BaseModel):
+    payment_id: str
+    tenant_id: str
+    event_id: str
+    resolution_id: str | None
+    rules: MatchResultOut
+    agent: AgentResolutionOut | None
+
+
 class OutcomeIn(BaseModel):
-    outcome: str
+    outcome: str  # accepted_as_is | rejected | edited_subset | manual_alternative
     corrected_bill_ids: list[str] | None = None
     user_id: str | None = None
     accountant_reasoning: str | None = None
@@ -135,35 +150,16 @@ class BatchAutoMatchOut(BaseModel):
     no_match: list[dict[str, Any]]
 
 
-class AgentResolutionOut(BaseModel):
-    action: str
-    bill_ids: list[str]
-    confidence: float
-    reasoning: str
-    model_id: str
-    langsmith_run_id: str | None = None
-    langsmith_trace_url: str | None = None
-
-
-class AgentResolveIn(BaseModel):
-    model: str = Field(default_factory=lambda: DEFAULT_AGENT_MODEL)
-
-
-class MatchWithAgentOut(BaseModel):
-    payment_id: str
-    tenant_id: str
-    event_id: str
-    resolution_id: str | None
-    rules: MatchResultOut
-    agent: AgentResolutionOut | None
-
-
 # ---------- helpers ----------
+
+def _fmt_minor(minor: int, currency: str = "USD") -> str:
+    return f"{currency} {minor / 100:.2f}"
 
 
 def _payment_settlement(
     conn: sqlite3.Connection, tenant_id: str, payment_id: str
 ) -> PaymentSettlementOut | None:
+    """Bills already allocated to this payment (survives page reload)."""
     alloc = get_payment_allocation(conn, tenant_id, payment_id)
     if not alloc.matched_bill_ids:
         return None
@@ -178,18 +174,10 @@ def _payment_settlement(
 def _match_result_out(
     conn: sqlite3.Connection,
     tenant_id: str,
-    r: MatchResult,
+    r,
     event_id: str | None,
 ) -> MatchResultOut:
     cfg = load_tenant_config(conn, tenant_id)
-    alloc = get_payment_allocation(conn, tenant_id, r.payment_id)
-    if alloc.matched_bill_ids:
-        remaining = alloc.remaining_minor
-    else:
-        pay_row = conn.execute(
-            "SELECT amount_minor FROM payments WHERE payment_id = ?", (r.payment_id,)
-        ).fetchone()
-        remaining = int(pay_row["amount_minor"]) if pay_row else 0
     return MatchResultOut(
         payment_id=r.payment_id,
         tenant_id=r.tenant_id,
@@ -209,9 +197,9 @@ def _match_result_out(
         ranker_score=r.ranker_score,
         calibrated_accept_prob=r.calibrated_accept_prob,
         event_id=event_id,
-        allocated_sum_minor=alloc.allocated_sum_minor,
-        remaining_minor=remaining,
-        is_fully_allocated=alloc.is_fully_allocated,
+        allocated_sum_minor=r.allocated_sum_minor,
+        remaining_minor=r.remaining_minor,
+        is_fully_allocated=r.is_fully_allocated,
     )
 
 
@@ -223,7 +211,18 @@ def _latest_event_for_payment(conn: sqlite3.Connection, payment_id: str) -> str 
     return row["event_id"] if row else None
 
 
-def _agent_resolution_out(agent) -> AgentResolutionOut:
+# ---------- endpoints ----------
+
+
+
+def _langsmith_trace_url(run_id: str | None) -> str | None:
+    if not run_id:
+        return None
+    project = os.environ.get("LANGSMITH_PROJECT", "bulk-payments-poc")
+    return f"https://smith.langchain.com/o/default/projects/p/{project}/r/{run_id}"
+
+
+def _agent_resolution_out(agent) -> "AgentResolutionOut":
     run_id = agent.langsmith_run_id
     return AgentResolutionOut(
         action=agent.action.value,
@@ -234,10 +233,6 @@ def _agent_resolution_out(agent) -> AgentResolutionOut:
         langsmith_run_id=run_id,
         langsmith_trace_url=_langsmith_trace_url(run_id),
     )
-
-
-# ---------- routes ----------
-
 
 @app.get("/health")
 def health() -> dict[str, str]:
@@ -262,13 +257,12 @@ def list_payments(tenant_id: str) -> list[PaymentOut]:
     out: list[PaymentOut] = []
     for r in rows:
         pid = r["payment_id"]
-        currency = r["source_currency"] or "USD"
         out.append(
             PaymentOut(
                 payment_id=pid,
                 tenant_id=r["tenant_id"],
                 amount_minor=r["amount_minor"],
-                amount_display=_fmt_minor(r["amount_minor"], currency),
+                amount_display=_fmt_minor(r["amount_minor"], r["source_currency"] or "USD"),
                 payment_date=r["payment_date"],
                 counterparty_bank_name=r["counterparty_bank_name"],
                 description=r["description"] or "",
@@ -320,10 +314,10 @@ def run_match(tenant_id: str, payment_id: str) -> MatchResultOut:
         )
     except KeyError as e:
         conn.close()
-        raise HTTPException(status_code=404, detail=str(e)) from e
+        raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
         conn.close()
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=str(e))
 
     event_id = _latest_event_for_payment(conn, payment_id)
     out = _match_result_out(conn, tenant_id, r, event_id)
@@ -415,12 +409,19 @@ def latest_agent_resolution(tenant_id: str, payment_id: str) -> AgentResolutionO
 
 @app.post("/tenants/{tenant_id}/payments/{payment_id}/unmatch", response_model=UnmatchOut)
 def unmatch_payment_endpoint(tenant_id: str, payment_id: str) -> UnmatchOut:
+    """Release all bills allocated to this payment so it can be matched again from scratch."""
     conn = _get_conn()
+    try:
+        load_payment(conn, payment_id)
+    except KeyError:
+        conn.close()
+        raise HTTPException(status_code=404, detail="payment not found")
+
     try:
         freed = unmatch_payment(conn, tenant_id=tenant_id, payment_id=payment_id)
     except ValueError as e:
         conn.close()
-        raise HTTPException(status_code=400, detail=str(e)) from e
+        raise HTTPException(status_code=400, detail=str(e))
 
     event_id: str | None = None
     if freed:
@@ -432,25 +433,31 @@ def unmatch_payment_endpoint(tenant_id: str, payment_id: str) -> UnmatchOut:
             bill_ids=list(freed),
             rules_version=cfg.rules_version,
             features={"action": "unmatch", "freed_bill_count": len(freed)},
-            decision=DecisionKind.MANUAL.value,
-            outcome=OutcomeLabel.MANUAL_ALTERNATIVE.value,
+            decision="manual",
+            outcome="manual_alternative",
             reason_codes=["user_unmatch"],
         )
     conn.close()
-    return UnmatchOut(payment_id=payment_id, freed_bill_ids=freed, event_id=event_id)
+    return UnmatchOut(
+        payment_id=payment_id,
+        freed_bill_ids=list(freed),
+        event_id=event_id,
+    )
 
 
 @app.post("/match-events/{event_id}/outcome", response_model=OutcomeOut)
 def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
+    """Record accountant feedback by inserting a correction event (append-only)."""
     valid_outcomes = {o.value for o in OutcomeLabel}
     if body.outcome not in valid_outcomes:
         raise HTTPException(
             status_code=422,
             detail=f"outcome must be one of {sorted(valid_outcomes)}",
         )
-
     conn = _get_conn()
-    orig = conn.execute("SELECT * FROM match_events WHERE event_id = ?", (event_id,)).fetchone()
+    orig = conn.execute(
+        "SELECT * FROM match_events WHERE event_id = ?", (event_id,)
+    ).fetchone()
     if orig is None:
         conn.close()
         raise HTTPException(status_code=404, detail="event_id not found")
@@ -470,7 +477,7 @@ def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
             )
         except ValueError as e:
             conn.close()
-            raise HTTPException(status_code=422, detail=str(e)) from e
+            raise HTTPException(status_code=422, detail=str(e))
 
     new_event_id = insert_match_event(
         conn,
@@ -485,13 +492,19 @@ def record_outcome(event_id: str, body: OutcomeIn) -> OutcomeOut:
         calibrated_prob=orig["calibrated_prob"],
         reason_codes=json.loads(orig["reason_codes_json"]),
         user_id=body.user_id,
+        accountant_reasoning=body.accountant_reasoning,
     )
+
     conn.close()
     return OutcomeOut(event_id=new_event_id, outcome=body.outcome)
 
 
 @app.post("/tenants/{tenant_id}/auto-match", response_model=BatchAutoMatchOut)
 def batch_auto_match(tenant_id: str) -> BatchAutoMatchOut:
+    """
+    Run matcher on all open payments: auto-apply confident matches,
+    queue ambiguous suggestions for expert review.
+    """
     conn = _get_conn()
     row = conn.execute("SELECT tenant_id FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
     if row is None:
@@ -499,10 +512,11 @@ def batch_auto_match(tenant_id: str) -> BatchAutoMatchOut:
         raise HTTPException(status_code=404, detail="tenant not found")
 
     raw = run_batch_auto_match(conn, tenant_id=tenant_id, ranker_path=RANKER_PATH)
-    needs_review_out = [
-        _match_result_out(conn, tenant_id, r, event_id)
-        for r, event_id in raw.get("needs_review_results", [])
-    ]
+
+    needs_review_out: list[MatchResultOut] = []
+    for r, event_id in raw.get("needs_review_results", []):
+        needs_review_out.append(_match_result_out(conn, tenant_id, r, event_id))
+
     conn.close()
     return BatchAutoMatchOut(
         tenant_id=tenant_id,
@@ -513,11 +527,34 @@ def batch_auto_match(tenant_id: str) -> BatchAutoMatchOut:
     )
 
 
+@app.post("/tenants/{tenant_id}/ranker-gate")
+def set_ranker_gate(tenant_id: str, enable: bool = True) -> dict[str, Any]:
+    """Enable or disable ranker-probability gating for auto-apply on this tenant."""
+    conn = _get_conn()
+    row = conn.execute("SELECT tenant_id FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(status_code=404, detail="tenant not found")
+    conn.execute(
+        "UPDATE tenants SET use_ranker_threshold = ? WHERE tenant_id = ?",
+        (1 if enable else 0, tenant_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"tenant_id": tenant_id, "use_ranker_threshold": enable}
+
+
+@app.get("/tenants/{tenant_id}/eval")
+def eval_report(tenant_id: str) -> dict[str, Any]:
+    """Extended metrics: suggestion acceptance, calibration bins, slice breakdown, stop-loss."""
+    conn = _get_conn()
+    report = extended_eval_report(conn, tenant_id=tenant_id)
+    conn.close()
+    return report
+
+
 @app.get("/match-events")
-def list_events(
-    tenant_id: str | None = None,
-    payment_id: str | None = None,
-) -> list[dict[str, Any]]:
+def list_events(tenant_id: str | None = None, payment_id: str | None = None) -> list[dict[str, Any]]:
     conn = _get_conn()
     q = "SELECT * FROM match_events WHERE 1=1"
     params: list[Any] = []

@@ -62,25 +62,6 @@ export interface Tenant {
   date_window_days: number;
 }
 
-export interface AgentResolution {
-  action: "propose_match" | "no_match" | "need_more_info";
-  bill_ids: string[];
-  confidence: number;
-  reasoning: string;
-  model_id: string;
-  langsmith_run_id: string | null;
-  langsmith_trace_url: string | null;
-}
-
-export interface MatchWithAgentResult {
-  payment_id: string;
-  tenant_id: string;
-  event_id: string;
-  resolution_id: string | null;
-  rules: MatchResult;
-  agent: AgentResolution | null;
-}
-
 export interface BatchAutoMatchResponse {
   tenant_id: string;
   summary: {
@@ -98,6 +79,25 @@ export interface BatchAutoMatchResponse {
   }>;
   needs_review: MatchResult[];
   no_match: Array<{ payment_id: string; status: string; decision: string }>;
+}
+
+export interface AgentResolution {
+  action: "propose_match" | "no_match" | "need_more_info";
+  bill_ids: string[];
+  confidence: number;
+  reasoning: string;
+  model_id: string;
+  langsmith_run_id: string | null;
+  langsmith_trace_url: string | null;
+}
+
+export interface MatchWithAgentResult {
+  payment_id: string;
+  tenant_id: string;
+  event_id: string;
+  resolution_id: string | null;
+  rules: MatchResult;
+  agent: AgentResolution | null;
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {

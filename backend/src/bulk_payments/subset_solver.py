@@ -20,7 +20,7 @@ def find_feasible_subsets(
     Enumerate subsets S where |sum(S) - target| <= tolerance.
     Uses brute force for n <= 22 else meet-in-the-middle (exact for integers).
     """
-    amounts = [rb.bill.open_amount_minor for rb in candidates]
+    amounts = [rb.ledger_amount_minor for rb in candidates]
     ids = [rb.bill.bill_id for rb in candidates]
     n = len(amounts)
     if n == 0:

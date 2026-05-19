@@ -78,7 +78,7 @@ def test_auto_applied_does_not_invoke_llm(demo_conn):
     assert resolution.action == AgentAction.PROPOSE_MATCH
     assert resolution.model_id == "rules_engine"
     assert resolution.confidence == 1.0
-    assert set(resolution.bill_ids) == {"t2_b1", "t2_b2"}
+    assert set(resolution.bill_ids) == {"t2_b2", "t2_b4"}
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +131,9 @@ def test_mocked_no_match_pay_no_match(demo_conn):
     from bulk_payments.agent.resolver import resolve_with_agent
     from bulk_payments.matcher import match_payment
 
-    result = match_payment(demo_conn, tenant_id="t1", payment_id="pay_no_match", log_event=False)
+    result = match_payment(
+        demo_conn, tenant_id="t2", payment_id="pay_t2_no_match", log_event=False
+    )
     assert result.decision == DecisionKind.NO_CANDIDATES
 
     no_match_call = _make_tool_call_message(
@@ -140,7 +142,7 @@ def test_mocked_no_match_pay_no_match(demo_conn):
             "action": "no_match",
             "bill_ids": [],
             "confidence": 0.95,
-            "reasoning": "No open bills match the unknown counterparty bank.",
+            "reasoning": "No open bills close the payment amount in the omega week.",
         },
     )
 
@@ -151,8 +153,8 @@ def test_mocked_no_match_pay_no_match(demo_conn):
     with patch("bulk_payments.agent.resolver.get_chat_model", return_value=mock_llm):
         resolution = resolve_with_agent(
             demo_conn,
-            tenant_id="t1",
-            payment_id="pay_no_match",
+            tenant_id="t2",
+            payment_id="pay_t2_no_match",
             match_result=result,
         )
 

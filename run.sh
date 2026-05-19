@@ -14,12 +14,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND="${ROOT}/backend"
 FRONTEND="${ROOT}/frontend"
-VENV="${VENV:-${ROOT}/.venv}"
+VENV="${VENV:-${BACKEND}/.venv}"
 
 DB_PATH="${BULK_DB:-/tmp/bulk.db}"
-API_PORT="${BULK_API_PORT:-8000}"
-API_HOST="${BULK_API_HOST:-127.0.0.1}"
+API_PORT="${API_PORT:-8000}"
+API_HOST="${API_HOST:-127.0.0.1}"
 VITE_PORT="${VITE_PORT:-5173}"
 NO_SEED=0
 
@@ -76,9 +77,12 @@ if [[ ! -x "${VENV}/bin/python" ]]; then
   python3 -m venv "$VENV"
 fi
 
-echo "==> Installing Python package (editable + api + agent + dev)"
-"${VENV}/bin/pip" install -q --upgrade pip
-"${VENV}/bin/pip" install -q -e "${ROOT}[dev,api,agent]"
+echo "==> Installing backend (editable + dev + agent)"
+(
+  cd "$BACKEND"
+  "${VENV}/bin/pip" install -q --upgrade pip
+  "${VENV}/bin/pip" install -q -e ".[dev,agent]"
+)
 
 echo "==> Installing frontend dependencies"
 (
@@ -87,9 +91,6 @@ echo "==> Installing frontend dependencies"
 )
 
 export BULK_DB="$DB_PATH"
-export BULK_API_PORT="$API_PORT"
-export BULK_API_HOST="$API_HOST"
-export BULK_API_RELOAD=false
 
 if [[ "$NO_SEED" -eq 0 ]]; then
   echo "==> Seeding demo database at ${DB_PATH}"
@@ -110,7 +111,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "==> Starting API at ${API_URL}"
-"${VENV}/bin/bulk-api" &
+BULK_DB="$DB_PATH" "${VENV}/bin/bulk-match" serve --db "$DB_PATH" --host "$API_HOST" --port "$API_PORT" &
 API_PID=$!
 
 echo "==> Waiting for API health"

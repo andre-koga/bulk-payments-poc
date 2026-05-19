@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS tenants (
   max_candidates INTEGER NOT NULL DEFAULT 28,
   max_auto_amount_minor INTEGER,
   max_auto_bill_count INTEGER NOT NULL DEFAULT 50,
-  rules_version TEXT NOT NULL DEFAULT 'v1'
+  rules_version TEXT NOT NULL DEFAULT 'v1',
+  -- When 1, calibrated ranker probability must meet tau_auto before auto-apply.
+  -- Flip to 1 once per-tenant precision has been validated >= 95%.
+  use_ranker_threshold INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS vendors (
@@ -56,6 +59,20 @@ CREATE TABLE IF NOT EXISTS payments (
   fx_rate_used REAL NOT NULL DEFAULT 1.0,
   source_currency TEXT
 );
+
+-- FX rates: one row per (tenant, from_currency, effective_date). Latest row wins.
+CREATE TABLE IF NOT EXISTS fx_rates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tenant_id TEXT NOT NULL REFERENCES tenants(tenant_id),
+  from_currency TEXT NOT NULL,
+  to_currency TEXT NOT NULL,
+  rate REAL NOT NULL,
+  effective_date TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fx_rates_lookup
+  ON fx_rates(tenant_id, from_currency, to_currency, effective_date DESC);
 
 -- Append-only audit log for learning / evaluation
 CREATE TABLE IF NOT EXISTS match_events (
@@ -130,6 +147,7 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(DDL)
+    _migrate(conn)
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
         (str(SCHEMA_VERSION),),
@@ -137,21 +155,27 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def migrate_db(conn: sqlite3.Connection) -> None:
-    """Apply incremental migrations to an existing database.
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Apply incremental schema updates (idempotent)."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(match_events)").fetchall()}
+    if "accountant_reasoning" not in cols:
+        conn.execute(
+            "ALTER TABLE match_events ADD COLUMN accountant_reasoning TEXT"
+        )
 
-    Safe to call on a fresh DB (all migrations are idempotent via IF NOT EXISTS).
-    Checks the stored schema_version and applies only the needed migrations.
-    """
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
     current = int(row["value"]) if row else 0
-
     if current < 2:
         conn.executescript(_MIGRATION_V2)
         conn.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '2')"
         )
-        conn.commit()
+
+
+def migrate_db(conn: sqlite3.Connection) -> None:
+    """Public migration entry (also called from match_with_agent)."""
+    _migrate(conn)
+    conn.commit()
 
 
 def insert_match_event(
@@ -168,6 +192,7 @@ def insert_match_event(
     calibrated_prob: float | None = None,
     reason_codes: list[str] | None = None,
     user_id: str | None = None,
+    accountant_reasoning: str | None = None,
 ) -> str:
     event_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
@@ -176,8 +201,8 @@ def insert_match_event(
         INSERT INTO match_events(
           event_id, tenant_id, payment_id, bill_ids_json, rules_version,
           features_json, decision, outcome, ranker_score, calibrated_prob,
-          reason_codes_json, user_id, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+          reason_codes_json, user_id, accountant_reasoning, created_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             event_id,
@@ -192,6 +217,7 @@ def insert_match_event(
             calibrated_prob,
             json.dumps(reason_codes or []),
             user_id,
+            accountant_reasoning,
             now,
         ),
     )
@@ -205,8 +231,9 @@ def update_match_event_outcome(
     outcome: str,
     user_id: str | None = None,
 ) -> None:
-    # Append-only policy: we do not mutate rows; insert correction event in production.
-    # POC convenience: allow updating outcome for evaluation labelling.
+    """Update outcome in-place — only used by the eval/label-demo harness for synthetic labelling.
+    Production path: POST /match-events/{event_id}/outcome inserts an append-only correction row.
+    """
     conn.execute(
         """
         UPDATE match_events SET outcome = ?, user_id = COALESCE(?, user_id)

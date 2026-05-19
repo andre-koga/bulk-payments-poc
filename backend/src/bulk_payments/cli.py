@@ -6,7 +6,12 @@ import sys
 from pathlib import Path
 
 from bulk_payments.db import connect, init_db
-from bulk_payments.evaluation import label_events_for_training, run_eval
+from bulk_payments.evaluation import (
+    extended_eval_report,
+    label_events_for_training,
+    precision_stop_loss,
+    run_eval,
+)
 from bulk_payments.matcher import match_payment
 from bulk_payments.synthetic import create_db_with_seed
 from bulk_payments.train import train_and_save, train_per_tenant_models
@@ -32,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     p_eval.add_argument("--db", required=True)
     p_eval.add_argument("--ranker", default=None)
 
+    p_eval_ext = sub.add_parser("eval-extended", help="Suggestion acceptance, calibration, slices, stop-loss")
+    p_eval_ext.add_argument("--db", required=True)
+    p_eval_ext.add_argument("--tenant", default=None)
+    p_eval_ext.add_argument("--ranker", default=None)
+
     p_train = sub.add_parser("train-ranker", help="Train calibrated ranker from labeled match_events")
     p_train.add_argument("--db", required=True)
     p_train.add_argument("--out", required=True)
@@ -39,6 +49,27 @@ def main(argv: list[str] | None = None) -> int:
     p_train_t = sub.add_parser("train-ranker-tenants", help="Train one ranker per tenant into a directory")
     p_train_t.add_argument("--db", required=True)
     p_train_t.add_argument("--out-dir", required=True)
+
+    p_serve = sub.add_parser("serve", help="Start the FastAPI HTTP server")
+    p_serve.add_argument("--db", required=True)
+    p_serve.add_argument("--host", default="127.0.0.1")
+    p_serve.add_argument("--port", type=int, default=8000)
+    p_serve.add_argument("--ranker", default=None)
+
+    p_set_ranker = sub.add_parser("set-ranker-gate", help="Enable/disable ranker threshold for auto-apply on a tenant")
+    p_set_ranker.add_argument("--db", required=True)
+    p_set_ranker.add_argument("--tenant", required=True)
+    p_set_ranker.add_argument("--enable", action="store_true", default=False)
+    p_set_ranker.add_argument("--disable", dest="enable", action="store_false")
+
+    p_validate = sub.add_parser(
+        "validate-ranker-gate",
+        help="Check rolling precision; print whether ranker gating is safe to enable",
+    )
+    p_validate.add_argument("--db", required=True)
+    p_validate.add_argument("--tenant", required=True)
+    p_validate.add_argument("--window", type=int, default=50)
+    p_validate.add_argument("--min-precision", type=float, default=0.95)
 
     p_label = sub.add_parser("label-demo", help="Apply synthetic labels to latest events for training")
     p_label.add_argument("--db", required=True)
@@ -104,6 +135,60 @@ def main(argv: list[str] | None = None) -> int:
         conn.close()
         print(json.dumps(summary, indent=2))
         return 0 if summary.get("oracle_all_pass") else 1
+
+    if args.cmd == "set-ranker-gate":
+        conn = connect(args.db)
+        conn.execute(
+            "UPDATE tenants SET use_ranker_threshold = ? WHERE tenant_id = ?",
+            (1 if args.enable else 0, args.tenant),
+        )
+        conn.commit()
+        state = "enabled" if args.enable else "disabled"
+        print(f"ranker_gate={state} for tenant={args.tenant}")
+        conn.close()
+        return 0
+
+    if args.cmd == "validate-ranker-gate":
+        conn = connect(args.db)
+        result = precision_stop_loss(
+            conn,
+            tenant_id=args.tenant,
+            window=args.window,
+            min_precision=args.min_precision,
+        )
+        conn.close()
+        print(json.dumps(result, indent=2))
+        safe = result.get("above_threshold")
+        if safe is True:
+            print(f"\nSafe to enable: bulk-match set-ranker-gate --db {args.db} --tenant {args.tenant} --enable")
+            return 0
+        if safe is False:
+            print("\nNot safe: precision below threshold. Accumulate more corrections first.")
+            return 1
+        print("\nNot enough labeled auto-apply events yet.")
+        return 1
+
+    if args.cmd == "eval-extended":
+        conn = connect(args.db)
+        report = extended_eval_report(conn, tenant_id=args.tenant, ranker_path=args.ranker)
+        conn.close()
+        print(json.dumps(report, indent=2))
+        return 0
+
+    if args.cmd == "serve":
+        import os
+        import uvicorn
+
+        os.environ["BULK_DB"] = args.db
+        if args.ranker:
+            os.environ["BULK_RANKER"] = args.ranker
+        uvicorn.run(
+            "bulk_payments.api:app",
+            host=args.host,
+            port=args.port,
+            reload=False,
+        )
+        return 0
 
     if args.cmd == "label-demo":
         conn = connect(args.db)

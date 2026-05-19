@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+.Python
 *.egg
 *.egg-info/
 dist/
@@ -13,7 +14,6 @@ build/
 .venv/
 venv/
 env/
-.env
 
 # pytest / coverage
 .pytest_cache/
@@ -37,6 +37,7 @@ frontend/node_modules/
 
 # Build artifacts
 *.js.map
+*.tsbuildinfo
 
 # ML artefacts
 *.joblib
@@ -62,6 +63,3 @@ Thumbs.db
 .env
 .env.*
 !.env.example
-
-# Vite
-*.tsbuildinfo

@@ -38,10 +38,14 @@ def test_build_context_pay_bulk_1(demo_conn):
 
 def test_build_context_pay_no_match(demo_conn):
     """No-match payment: context should explain why rules failed."""
-    result = match_payment(demo_conn, tenant_id="t1", payment_id="pay_no_match", log_event=False)
+    result = match_payment(
+        demo_conn, tenant_id="t2", payment_id="pay_t2_no_match", log_event=False
+    )
     assert result.decision == DecisionKind.NO_CANDIDATES
 
-    ctx = build_context(demo_conn, tenant_id="t1", payment_id="pay_no_match", match_result=result)
+    ctx = build_context(
+        demo_conn, tenant_id="t2", payment_id="pay_t2_no_match", match_result=result
+    )
 
     assert ctx["rules_engine"]["decision"] == "no_candidates"
     assert len(ctx["rules_engine"]["reason_codes"]) > 0

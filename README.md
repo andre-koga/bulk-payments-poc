@@ -2,10 +2,15 @@
 
 Precision-first matching of one bank payment to multiple open bills: retrieval, hard gates, subset-sum search, auto vs suggest policy, audit logging, optional calibrated ranker training, and an AI agent layer for ambiguous cases.
 
-## Setup
+## Layout
+
+- **`backend/`** — Python package (`bulk-payments`) and tests
+- **`frontend/`** — React (Vite + TypeScript)
+
+## Backend setup
 
 ```bash
-cd /path/to/bulk-payments
+cd /path/to/bulk-payments/backend
 python -m venv .venv && source .venv/bin/activate
 
 # Core only (rules engine + ranker)
@@ -16,6 +21,8 @@ pip install -e ".[dev,agent]"
 ```
 
 ## CLI — rules engine
+
+From the activated venv (after backend install):
 
 ```bash
 bulk-match init-db --db /tmp/bulk.db
@@ -51,7 +58,15 @@ bulk-match agent-batch --db /tmp/bulk.db --tenant t1 --model gpt-4o-mini
 | `LANGSMITH_PROJECT` | LangSmith | Project name (default: `bulk-payments-poc`) |
 | `BULK_AGENT_ENABLED=false` | agent commands | Disable AI agent (rules-only fallback) |
 
-## Library usage — rules engine
+## Frontend
+
+```bash
+cd /path/to/bulk-payments/frontend
+npm install   # once
+npm run dev
+```
+
+## Library usage
 
 ```python
 from bulk_payments.matcher import match_payment
@@ -113,11 +128,12 @@ Put secrets in `.env` at the repo root (see `.gitignore`). Options: `./run.sh --
 Terminal 1 — API (uses `BULK_DB`, default `/tmp/bulk.db`):
 
 ```bash
+cd backend
 export BULK_DB=/tmp/bulk.db
 export OPENAI_API_KEY=sk-...   # required for agent-resolve
 bulk-match seed --db "$BULK_DB"
-pip install -e ".[api,agent]"
-bulk-api
+pip install -e ".[dev,agent]"
+bulk-match serve --db "$BULK_DB" --port 8000
 # or: uvicorn bulk_payments.api:app --reload --port 8000
 ```
 
